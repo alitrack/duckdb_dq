@@ -5,10 +5,10 @@
 //!   semantic_dry_plan(sql)       → expand modeled SQL (no execution)
 //!   semantic_models()            → table function: list loaded models available
 
-use libduckdb_sys::{duckdb_connection, duckdb_data_chunk, duckdb_function_info, duckdb_vector};
+use libduckdb_sys::{duckdb_data_chunk, duckdb_function_info, duckdb_vector};
 use once_cell::sync::OnceCell;
 use quack_rs::connection::Connection;
-use quack_rs::{entry_point, entry_point_v2};
+use quack_rs::entry_point_v2;
 use quack_rs::prelude::*;
 use quack_rs::scalar::ScalarFunctionBuilder;
 use quack_rs::table::TableFunctionBuilder;
@@ -179,7 +179,7 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             }
 
             let remaining = state.models.len() - state.cursor;
-            let batch = remaining.min(2048);
+            let _batch = remaining.min(2048);
 
             let (name, catalog, schema, table, col_count) =
                 &state.models[state.cursor];

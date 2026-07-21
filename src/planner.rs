@@ -167,7 +167,7 @@ fn expand_select_item(
         SelectItem::UnnamedExpr(expr) => {
             expand_expr(expr, model_map);
         }
-        SelectItem::ExprWithAlias { expr, alias } => {
+        SelectItem::ExprWithAlias { expr, .. } => {
             expand_expr(expr, model_map);
         }
         _ => {}
@@ -412,26 +412,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
-    fn parse_expr_directly() {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let cases = vec![
-            "first_name || ' ' || last_name",
-            "total * 1.1",
-            "(SELECT COALESCE(SUM(o.total), 0) FROM public.orders o WHERE o.customer_id = customers.id)",
-        ];
-        for exp_str in &cases {
-            if let Ok(mut parser) = sqlparser::parser::Parser::new(&dialect).try_with_sql(exp_str) {
-                match parser.parse_expr() {
-                    Ok(e) => eprintln!("OK [{}]: {}", exp_str, e),
-                    Err(e) => eprintln!("PARSE_ERR [{}]: {}", exp_str, e),
-                }
-            } else {
-                eprintln!("TRY_ERR [{}]", exp_str);
-            }
-        }
-    }
 
     #[test]
 
