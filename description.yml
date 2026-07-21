@@ -1,0 +1,29 @@
+# description.yml — community extension metadata
+extension:
+  name: semantic
+  version: 0.1.0
+  description: >-
+    Semantic layer for DuckDB. Write SQL against business-meaningful model
+    names; the extension expands model references, calculated fields, and
+    relationships into executable physical SQL.
+  license: MIT
+  language: Rust
+  maintainers:
+    - name: alitrack
+      email: track@statsape.com
+repo:
+  github: alitrack/duckdb_semantic
+  ref: v0.1.0
+build:
+  source: rust
+  rust:
+    target: x86_64-unknown-linux-gnu
+platforms:
+  linux_amd64:
+    build: true
+  linux_arm64:
+    build: true
+  osx_amd64:
+    build: true
+  osx_arm64:
+    build: true
