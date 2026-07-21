@@ -26,7 +26,9 @@ pub fn expand_sql(sql: &str, ctx: &SemanticContext) -> Result<String, String> {
     // Walk the AST and expand model references
     expand_statement(&mut ast[0], ctx)?;
 
-    Ok(ast[0].to_string())
+    let result = ast[0].to_string();
+    eprintln!("EXPANDED: {}", result);
+    Ok(result)
 }
 
 /// Recursively expand model references in a statement.
@@ -88,11 +90,14 @@ fn expand_select_item(
     item: &mut SelectItem,
     model_map: &std::collections::HashMap<String, &crate::mdl::Model>,
 ) {
+    eprintln!("model_map keys: {:?}", model_map.keys().collect::<Vec<_>>());
     match item {
         SelectItem::UnnamedExpr(expr) => {
+            eprintln!("  expanding expr: {:?}", expr);
             expand_expr(expr, model_map);
         }
-        SelectItem::ExprWithAlias { expr, .. } => {
+        SelectItem::ExprWithAlias { expr, alias } => {
+            eprintln!("  expanding expr with alias {}: {:?}", alias, expr);
             expand_expr(expr, model_map);
         }
         _ => {}
@@ -103,34 +108,28 @@ fn expand_expr(
     expr: &mut sqlparser::ast::Expr,
     model_map: &std::collections::HashMap<String, &crate::mdl::Model>,
 ) {
+    // Helper: try parsing a calculated field expression and substitute it
+    let try_substitute = |expr: &mut sqlparser::ast::Expr, exp_str: &str| -> bool {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        if let Ok(mut parser) = sqlparser::parser::Parser::new(&dialect).try_with_sql(exp_str) {
+            if let Ok(parsed) = parser.parse_expr() {
+                *expr = parsed;
+                return true;
+            }
+        }
+        false
+    };
+
     match expr {
         sqlparser::ast::Expr::CompoundIdentifier(idents) => {
-            // "model.column" pattern
             if idents.len() == 2 {
                 let qualifier = &idents[0].value;
                 let col_name = &idents[1].value;
                 if let Some(model) = model_map.get(qualifier) {
                     if let Some(col) = model.columns.iter().find(|c| &c.name == col_name) {
                         if col.is_calculated {
-                            if let Some(ref exp) = col.expression {
-                                // Parse the expression and replace
-                                let dialect = sqlparser::dialect::GenericDialect {};
-                                if let Ok(mut parsed) =
-                                    sqlparser::parser::Parser::parse_sql(&dialect, exp)
-                                {
-                                    if let Some(Statement::Query(q)) = parsed.first_mut() {
-                                        if let SetExpr::Select(s) = &*q.body {
-                                            if let Some(first) = s.projection.first() {
-                                                match first {
-                                                    SelectItem::UnnamedExpr(e) => {
-                                                        *expr = e.clone();
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                            if let Some(ref exp_str) = col.expression {
+                                try_substitute(expr, exp_str);
                             }
                         }
                     }
@@ -138,29 +137,12 @@ fn expand_expr(
             }
         }
         sqlparser::ast::Expr::Identifier(ident) => {
-            // Bare column name — check if any model has a calculated field with this name
             let col_name = &ident.value;
             for (_qual, model) in model_map.iter() {
                 if let Some(col) = model.columns.iter().find(|c| &c.name == col_name) {
                     if col.is_calculated {
-                        if let Some(ref exp) = col.expression {
-                            let dialect = sqlparser::dialect::GenericDialect {};
-                            if let Ok(mut parsed) =
-                                sqlparser::parser::Parser::parse_sql(&dialect, exp)
-                            {
-                                if let Some(Statement::Query(q)) = parsed.first_mut() {
-                                    if let SetExpr::Select(s) = &*q.body {
-                                        if let Some(first) = s.projection.first() {
-                                            match first {
-                                                SelectItem::UnnamedExpr(e) => {
-                                                    *expr = e.clone();
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        if let Some(ref exp_str) = col.expression {
+                            try_substitute(expr, exp_str);
                         }
                         break;
                     }
@@ -200,19 +182,19 @@ fn expand_table_factor(
                 }
                 // table_reference models → replace with physical name
                 else if let Some(ref tr) = model.table_reference {
-                    let mut parts: Vec<String> = Vec::new();
+                    let mut parts: Vec<sqlparser::ast::Ident> = Vec::new();
                     if let Some(ref catalog) = tr.catalog {
                         if !catalog.is_empty() {
-                            parts.push(ident(catalog));
+                            parts.push(sqlparser::ast::Ident::new(catalog));
                         }
                     }
                     if let Some(ref schema) = tr.schema {
                         if !schema.is_empty() {
-                            parts.push(ident(schema));
+                            parts.push(sqlparser::ast::Ident::new(schema));
                         }
                     }
-                    parts.push(ident(&tr.table));
-                    *name = ObjectName(vec![sqlparser::ast::Ident::new(parts.join("."))]);
+                    parts.push(sqlparser::ast::Ident::new(&tr.table));
+                    *name = ObjectName(parts);
                 }
             }
         }
@@ -357,6 +339,28 @@ mod tests {
         // Phase 3: calculated field expansion parsed but may need expression format tuning
         // The structure is correct; expression rendering is WIP
         assert!(result.contains("total_spent"));
+    }
+
+    #[test]
+
+    #[test]
+    fn parse_expr_directly() {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let cases = vec![
+            "first_name || ' ' || last_name",
+            "total * 1.1",
+            "(SELECT COALESCE(SUM(o.total), 0) FROM public.orders o WHERE o.customer_id = customers.id)",
+        ];
+        for exp_str in &cases {
+            if let Ok(mut parser) = sqlparser::parser::Parser::new(&dialect).try_with_sql(exp_str) {
+                match parser.parse_expr() {
+                    Ok(e) => eprintln!("OK [{}]: {}", exp_str, e),
+                    Err(e) => eprintln!("PARSE_ERR [{}]: {}", exp_str, e),
+                }
+            } else {
+                eprintln!("TRY_ERR [{}]", exp_str);
+            }
+        }
     }
 
     #[test]
