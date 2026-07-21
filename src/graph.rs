@@ -142,6 +142,19 @@ impl SemGraph {
             None => vec![],
         }
     }
+    /// Return all edges as (from, to, condition) tuples for serialization.
+    pub fn edges(&self) -> Vec<(String, String, String)> {
+        self.graph
+            .edge_indices()
+            .filter_map(|ei| {
+                let (u, v) = self.graph.edge_endpoints(ei)?;
+                let from = self.idx_to_name.get(&u)?.clone();
+                let to = self.idx_to_name.get(&v)?.clone();
+                let cond = self.graph[ei].clone();
+                Some((from, to, cond))
+            })
+            .collect()
+    }
 }
 
 static SEM_GRAPH: Lazy<Mutex<SemGraph>> = Lazy::new(|| Mutex::new(SemGraph::new()));

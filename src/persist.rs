@@ -154,8 +154,12 @@ pub fn capture() -> Result<Snapshot, String> {
         }
     }
 
-    // Graph edges — extract from discover()
-    // (Graph doesn't expose edge iteration, so we skip for now)
+    // Graph edges
+    if let Ok(g) = graph::get_graph().lock() {
+        snap.graph_edges = g.edges().into_iter().map(|(from, to, cond)| {
+            EdgeSnapshot { from, to, condition: cond }
+        }).collect();
+    }
 
     // Ontology
     if let Ok(o) = ontology::get_ontology().lock() {

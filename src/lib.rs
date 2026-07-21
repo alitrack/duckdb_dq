@@ -519,6 +519,54 @@ unsafe extern "C" fn semantic_bm25_reset_fn(
     unsafe { VectorWriter::new(output).write_str(0, "BM25 index cleared"); }
 }
 
+unsafe extern "C" fn semantic_bm25_stemmer_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let reader = unsafe { VectorReader::new(input, 0) };
+    let mut writer = unsafe { VectorWriter::new(output) };
+    let lang = if reader.row_count() > 0 && unsafe { reader.is_valid(0) } {
+        unsafe { reader.read_str(0).to_string() }
+    } else {
+        "english".to_string()
+    };
+    let algorithm = match lang.as_str() {
+        "arabic" => rust_stemmers::Algorithm::Arabic,
+        "danish" => rust_stemmers::Algorithm::Danish,
+        "dutch" => rust_stemmers::Algorithm::Dutch,
+        "english" => rust_stemmers::Algorithm::English,
+        "french" => rust_stemmers::Algorithm::French,
+        "german" => rust_stemmers::Algorithm::German,
+        "greek" => rust_stemmers::Algorithm::Greek,
+        "hungarian" => rust_stemmers::Algorithm::Hungarian,
+        "italian" => rust_stemmers::Algorithm::Italian,
+        "norwegian" => rust_stemmers::Algorithm::Norwegian,
+        "portuguese" => rust_stemmers::Algorithm::Portuguese,
+        "romanian" => rust_stemmers::Algorithm::Romanian,
+        "russian" => rust_stemmers::Algorithm::Russian,
+        "spanish" => rust_stemmers::Algorithm::Spanish,
+        "swedish" => rust_stemmers::Algorithm::Swedish,
+        "tamil" => rust_stemmers::Algorithm::Tamil,
+        "turkish" => rust_stemmers::Algorithm::Turkish,
+        "none" => {
+            if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
+                bm.clear_stemmer();
+            }
+            unsafe { writer.write_str(0, "Stemmer disabled"); }
+            return;
+        }
+        _ => {
+            unsafe { writer.write_str(0, &format!("Unknown language: {}. Use 'none' to disable.", lang)) };
+            return;
+        }
+    };
+    if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
+        bm.set_stemmer(rust_stemmers::Stemmer::create(algorithm));
+        unsafe { writer.write_str(0, &format!("Stemmer set to {}", lang)); }
+    }
+}
+
 // ─── BM25 search state ──────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -929,6 +977,11 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
         ScalarFunctionBuilder::new("semantic_bm25_reset")
             .returns(TypeId::Varchar)
             .function(semantic_bm25_reset_fn).register(raw_con)?;
+    }
+    unsafe {
+        ScalarFunctionBuilder::new("semantic_bm25_stemmer")
+            .param(TypeId::Varchar).returns(TypeId::Varchar)
+            .function(semantic_bm25_stemmer_fn).register(raw_con)?;
     }
 
     // ── BM25: semantic_bm25_search(query, k) → table ──

@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use rust_stemmers::{Algorithm, Stemmer};
 
 // ─── Inverted index ─────────────────────────────────────────────────────
 
@@ -25,7 +26,7 @@ struct DocStats {
 }
 
 /// Inverted index: term → doc_id → term frequency.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct Bm25Index {
     /// term → (doc_id → tf)
     pub inverted: HashMap<String, BTreeMap<String, u32>>,
@@ -35,6 +36,9 @@ pub struct Bm25Index {
     doc_count: usize,
     /// Sum of all document lengths.
     total_len: usize,
+    /// Optional stemmer for language-specific stemming.
+    #[allow(dead_code)]
+    stemmer: Option<Stemmer>,
 }
 
 /// BM25 parameters.
@@ -46,7 +50,25 @@ impl Bm25Index {
         Self::default()
     }
 
-    /// Reset index to empty.
+    /// New index with an English Porter stemmer.
+    pub fn with_english_stemmer() -> Self {
+        Self {
+            stemmer: Some(Stemmer::create(Algorithm::English)),
+            ..Default::default()
+        }
+    }
+
+    /// Set a custom stemmer.
+    pub fn set_stemmer(&mut self, s: Stemmer) {
+        self.stemmer = Some(s);
+    }
+
+    /// Disable stemming.
+    pub fn clear_stemmer(&mut self) {
+        self.stemmer = None;
+    }
+
+    /// Reset index to empty (preserves stemmer setting).
     pub fn reset(&mut self) {
         self.inverted.clear();
         self.docs.clear();
@@ -54,18 +76,30 @@ impl Bm25Index {
         self.total_len = 0;
     }
 
-    /// Tokenize text: lowercase, split on Unicode word boundaries.
-    fn tokenize(text: &str) -> Vec<String> {
-        text.to_lowercase()
+    /// Tokenize text: lowercase, split on non-alphanumeric, optional stemming.
+    fn tokenize_inner(text: &str, stemmer: Option<&Stemmer>) -> Vec<String> {
+        let tokens: Vec<String> = text
+            .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty() && t.len() >= 2)
-            .map(|t| t.to_string())
-            .collect()
+            .map(|t| {
+                if let Some(s) = stemmer {
+                    s.stem(t).to_string()
+                } else {
+                    t.to_string()
+                }
+            })
+            .collect();
+        tokens
+    }
+
+    fn tokenize(&self, text: &str) -> Vec<String> {
+        Self::tokenize_inner(text, self.stemmer.as_ref())
     }
 
     /// Index a single document by (id, text).
     pub fn index_doc(&mut self, doc_id: &str, text: &str) {
-        let tokens = Self::tokenize(text);
+        let tokens = self.tokenize(text);
         let len = tokens.len();
 
         // Remove old entry if this id existed
@@ -147,7 +181,7 @@ impl Bm25Index {
 
     /// Search top-k documents by BM25 score for a text query.
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
-        let terms = Self::tokenize(query);
+        let terms = self.tokenize(query);
         if terms.is_empty() || self.docs.is_empty() {
             return vec![];
         }
@@ -215,7 +249,7 @@ pub struct Bm25Snapshot {
 // ─── Global BM25 store ──────────────────────────────────────────────────
 
 static BM25_STORE: once_cell::sync::Lazy<Mutex<Bm25Index>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(Bm25Index::new()));
+    once_cell::sync::Lazy::new(|| Mutex::new(Bm25Index::with_english_stemmer()));
 
 pub fn get_bm25() -> &'static Mutex<Bm25Index> {
     &BM25_STORE
@@ -229,13 +263,35 @@ mod tests {
 
     #[test]
     fn tokenize_basic() {
-        let tokens = Bm25Index::tokenize("Hello, World! DuckDB is great.");
+        let idx = Bm25Index::new();
+        let tokens = Bm25Index::tokenize_inner("Hello, World! DuckDB is great.", None);
         assert!(tokens.contains(&"hello".to_string()));
         assert!(tokens.contains(&"world".to_string()));
         assert!(tokens.contains(&"duckdb".to_string()));
-        // "is" is 2 chars, passes >= 2 filter
         assert!(tokens.contains(&"is".to_string()));
         assert!(tokens.contains(&"great".to_string()));
+    }
+
+    #[test]
+    fn tokenize_with_stemmer() {
+        let idx = Bm25Index::with_english_stemmer();
+        let tokens = idx.tokenize("running runs runner easily");
+        // Porter stemmer: running→run, runs→run, runner→runner, easily→easili
+        assert!(tokens.contains(&"run".to_string()));
+        assert!(!tokens.contains(&"running".to_string()));
+    }
+
+    #[test]
+    fn stemmer_search_matches_variants() {
+        let mut idx = Bm25Index::with_english_stemmer();
+        idx.index_doc("d1", "The database runs analytical queries");
+        idx.index_doc("d2", "Running is good exercise");
+
+        // "running" stems to "run", matches both "runs" and "running"
+        let results = idx.search("running", 3);
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"d1")); // "runs" → "run"
+        assert!(ids.contains(&"d2")); // "running" → "run"
     }
 
     #[test]

@@ -1,3 +1,6 @@
 /target
+build/
 configure/venv
+configure/extension_version.txt
+configure/platform.txt
 *.duckdb_extension
