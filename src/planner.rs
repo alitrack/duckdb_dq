@@ -62,6 +62,8 @@ fn expand_setexpr(expr: &mut SetExpr, ctx: &SemanticContext) -> Result<(), Strin
             for item in &mut select.projection {
                 expand_select_item(item, &model_map);
             }
+            // Phase 5: expand SELECT * to exclude hidden columns
+            expand_wildcard(select, &model_map);
         }
         _ => {}
     }
@@ -158,6 +160,81 @@ fn parse_join_condition(condition: &str) -> Result<sqlparser::ast::Expr, String>
         .map_err(|e| format!("Condition parse error: {}", e))
 }
 
+/// Expand SELECT * to exclude hidden columns from models.
+fn expand_wildcard(
+    select: &mut sqlparser::ast::Select,
+    model_map: &std::collections::HashMap<String, &crate::mdl::Model>,
+) {
+    use sqlparser::ast::WildcardAdditionalOptions;
+    let mut new_projection: Vec<SelectItem> = Vec::new();
+    let mut expanded = false;
+
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                // Check if any model has hidden columns
+                let has_hidden = model_map.values().any(|m| {
+                    m.columns.iter().any(|c| c.is_hidden)
+                });
+                if !has_hidden {
+                    new_projection.push(item.clone());
+                    continue;
+                }
+                for (_key, model) in model_map.iter() {
+                    for col in &model.columns {
+                        if !col.is_hidden {
+                            cols.push(SelectItem::UnnamedExpr(
+                                sqlparser::ast::Expr::CompoundIdentifier(vec![
+                                    sqlparser::ast::Ident::new(&model.name),
+                                    sqlparser::ast::Ident::new(&col.name),
+                                ]),
+                            ));
+                        }
+                    }
+                }
+                if !cols.is_empty() {
+                    new_projection.extend(cols);
+                    expanded = true;
+                }
+            }
+            _ => {
+                new_projection.push(item.clone());
+            }
+        }
+    }
+
+    if expanded {
+        select.projection = new_projection;
+    }
+}
+
+/// Expand a view reference in a table factor to its SQL subquery.
+fn expand_view(
+    factor: &mut TableFactor,
+    ctx: &SemanticContext,
+) -> bool {
+    if let TableFactor::Table { name, alias, .. } = factor {
+        let view_name = name_to_table_name(name);
+        if let Some(view) = ctx.views.iter().find(|v| v.name == view_name) {
+            let alias_clause = alias
+                .as_ref()
+                .map(|a| format!(" AS {}", a.name))
+                .unwrap_or_default();
+            let derived = format!("({}){}", view.statement, alias_clause);
+            *factor = TableFactor::Table {
+                name: sqlparser::ast::ObjectName(vec![
+                    sqlparser::ast::Ident::new(derived),
+                ]),
+                alias: None, args: None, with_hints: vec![],
+                version: None, partitions: vec![],
+                with_ordinality: false, json_path: None,
+            };
+            return true;
+        }
+    }
+    false
+}
+
 /// Expand a calculated field reference in a SELECT item.
 fn expand_select_item(
     item: &mut SelectItem,
@@ -230,6 +307,10 @@ fn expand_table_factor(
 ) -> Result<(), String> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
+            // Check if this is a view first
+            if expand_view(factor, ctx) {
+                return Ok(());
+            }
             let table_name = name_to_table_name(name);
             if let Some(model) = ctx.models.iter().find(|m| m.name == table_name) {
                 // ref_sql models → wrap as derived table (subquery)
@@ -355,6 +436,61 @@ mod tests {
         let ctx = make_ctx();
         let result = expand_sql("SELECT id FROM orders", &ctx).unwrap();
         assert_eq!(result, "SELECT id FROM public.orders");
+    }
+
+
+    #[test]
+    fn expand_view_reference() {
+        let mut ctx = make_ctx();
+        ctx.views.push(crate::mdl::View {
+            name: "active_customers".into(),
+            statement: "SELECT * FROM my_db.public.customers WHERE active = true".into(),
+        });
+
+        let result = expand_sql(
+            "SELECT name FROM active_customers",
+            &ctx,
+        )
+        .unwrap();
+        assert!(result.contains("active = true"));
+        assert!(result.contains("my_db.public.customers"));
+    }
+
+    #[test]
+    fn expand_wildcard_excludes_hidden() {
+        let mut ctx = make_ctx();
+        ctx.models[0].columns.push(crate::mdl::Column {
+            name: "secret_notes".into(),
+            col_type: "VARCHAR".into(),
+            is_calculated: false,
+            expression: None,
+            not_null: false,
+            is_primary_key: false,
+            description: None,
+            is_hidden: true,
+        });
+
+        let result = expand_sql(
+            "SELECT * FROM customers",
+            &ctx,
+        )
+        .unwrap();
+        assert!(result.contains("customers.id"));
+        assert!(result.contains("customers.name"));
+        assert!(!result.contains("secret_notes"));
+        assert!(!result.contains("*"));
+    }
+
+    #[test]
+    fn expand_wildcard_no_hidden_columns_keeps_star() {
+        let ctx = make_ctx();
+        // Single model with no hidden columns — * stays
+        let result = expand_sql(
+            "SELECT * FROM customers",
+            &ctx,
+        )
+        .unwrap();
+        assert!(result.contains("*"));
     }
 
     #[test]
