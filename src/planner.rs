@@ -27,7 +27,6 @@ pub fn expand_sql(sql: &str, ctx: &SemanticContext) -> Result<String, String> {
     expand_statement(&mut ast[0], ctx)?;
 
     let result = ast[0].to_string();
-    eprintln!("EXPANDED: {}", result);
     Ok(result)
 }
 
@@ -46,13 +45,18 @@ fn expand_setexpr(expr: &mut SetExpr, ctx: &SemanticContext) -> Result<(), Strin
     match expr {
         SetExpr::Select(select) => {
             // Phase 2: expand table references in FROM clause and all JOINs
+            let mut models_in_from: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for table_with_joins in &mut select.from {
                 expand_table_factor(&mut table_with_joins.relation, ctx)?;
-                // Also expand tables in JOIN clauses
+                collect_model_name(&table_with_joins.relation, ctx, &mut models_in_from);
                 for join in &mut table_with_joins.joins {
                     expand_table_factor(&mut join.relation, ctx)?;
+                    collect_model_name(&join.relation, ctx, &mut models_in_from);
                 }
             }
+            // Phase 4: auto-inject relationship joins for implicit cross-joins
+            inject_relationship_joins(select, ctx, &models_in_from)?;
             // Phase 3: expand calculated fields in SELECT
             let model_map = build_model_map(ctx, &select.from);
             for item in &mut select.projection {
@@ -85,19 +89,85 @@ fn build_model_map<'a>(
     map
 }
 
+/// Collect the semantic model name (if any) from a table factor.
+fn collect_model_name(
+    factor: &TableFactor,
+    ctx: &SemanticContext,
+    out: &mut std::collections::HashSet<String>,
+) {
+    if let TableFactor::Table { name, .. } = factor {
+        let model_name = name_to_table_name(name);
+        if ctx.models.iter().any(|m| m.name == model_name) {
+            out.insert(model_name);
+        }
+    }
+}
+
+/// Auto-inject JOINs for implicit cross-joins.
+fn inject_relationship_joins(
+    select: &mut sqlparser::ast::Select,
+    ctx: &SemanticContext,
+    models_in_from: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if ctx.relationships.is_empty() || models_in_from.len() < 2 {
+        return Ok(());
+    }
+    for rel in &ctx.relationships {
+        if rel.models.len() != 2 { continue; }
+        let a = &rel.models[0];
+        let b = &rel.models[1];
+        if models_in_from.contains(a) && models_in_from.contains(b) {
+            let already_joined = select.from.iter().any(|twj| {
+                twj.joins.iter().any(|j| {
+                    if let TableFactor::Table { name, .. } = &j.relation {
+                        let n = name_to_table_name(name);
+                        n == *b || n == *a
+                    } else { false }
+                })
+            });
+            if !already_joined {
+                if let Some(twj) = select.from.first_mut() {
+                    let join_expr = parse_join_condition(&rel.condition)?;
+                    twj.joins.push(sqlparser::ast::Join {
+                        relation: sqlparser::ast::TableFactor::Table {
+                            name: sqlparser::ast::ObjectName(vec![
+                                sqlparser::ast::Ident::new(b),
+                            ]),
+                            alias: None, args: None, with_hints: vec![],
+                            version: None, partitions: vec![],
+                            with_ordinality: false, json_path: None,
+                        },
+                        join_operator: sqlparser::ast::JoinOperator::Inner(
+                            sqlparser::ast::JoinConstraint::On(join_expr),
+                        ),
+                        global: false,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_join_condition(condition: &str) -> Result<sqlparser::ast::Expr, String> {
+    let dialect = sqlparser::dialect::GenericDialect {};
+    let mut parser = sqlparser::parser::Parser::new(&dialect)
+        .try_with_sql(condition)
+        .map_err(|e| format!("Parse error: {}", e))?;
+    parser.parse_expr()
+        .map_err(|e| format!("Condition parse error: {}", e))
+}
+
 /// Expand a calculated field reference in a SELECT item.
 fn expand_select_item(
     item: &mut SelectItem,
     model_map: &std::collections::HashMap<String, &crate::mdl::Model>,
 ) {
-    eprintln!("model_map keys: {:?}", model_map.keys().collect::<Vec<_>>());
     match item {
         SelectItem::UnnamedExpr(expr) => {
-            eprintln!("  expanding expr: {:?}", expr);
             expand_expr(expr, model_map);
         }
         SelectItem::ExprWithAlias { expr, alias } => {
-            eprintln!("  expanding expr with alias {}: {:?}", alias, expr);
             expand_expr(expr, model_map);
         }
         _ => {}
@@ -336,9 +406,9 @@ mod tests {
         .unwrap();
         // Table reference expansion works
         assert!(result.contains("my_db.public.customers"));
-        // Phase 3: calculated field expansion parsed but may need expression format tuning
-        // The structure is correct; expression rendering is WIP
-        assert!(result.contains("total_spent"));
+        // Phase 3: calculated fields are expanded, so total_spent is replaced
+        // by its expression — total_spent won't appear in output
+        assert!(!result.contains("total_spent"));
     }
 
     #[test]
@@ -361,6 +431,49 @@ mod tests {
                 eprintln!("TRY_ERR [{}]", exp_str);
             }
         }
+    }
+
+    #[test]
+
+    #[test]
+    fn expand_with_relationship_join() {
+        let mut ctx = make_ctx();
+        ctx.relationships.push(crate::mdl::Relationship {
+            name: "customer_orders".into(),
+            models: vec!["customers".into(), "orders".into()],
+            join_type: "ONE_TO_MANY".into(),
+            condition: "customers.id = orders.customer_id".into(),
+        });
+
+        let result = expand_sql(
+            "SELECT customers.name, orders.total FROM customers, orders",
+            &ctx,
+        )
+        .unwrap();
+        eprintln!("REL JOIN: {}", result);
+        assert!(result.contains("JOIN"));
+        assert!(result.contains("customers.id = orders.customer_id"));
+        assert!(result.contains("my_db.public.customers"));
+    }
+
+    #[test]
+    fn expand_no_join_when_explicit_join_exists() {
+        let mut ctx = make_ctx();
+        ctx.relationships.push(crate::mdl::Relationship {
+            name: "customer_orders".into(),
+            models: vec!["customers".into(), "orders".into()],
+            join_type: "ONE_TO_MANY".into(),
+            condition: "customers.id = orders.customer_id".into(),
+        });
+
+        let result = expand_sql(
+            "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id = o.customer_id",
+            &ctx,
+        )
+        .unwrap();
+        // Should only have one JOIN (the explicit one), not inject a duplicate
+        let join_count = result.matches("JOIN").count();
+        assert_eq!(join_count, 1, "Should not inject duplicate JOIN: {}", result);
     }
 
     #[test]
