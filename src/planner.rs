@@ -181,6 +181,7 @@ fn expand_wildcard(
                     continue;
                 }
                 for (_key, model) in model_map.iter() {
+                    let mut cols: Vec<SelectItem> = Vec::new();
                     for col in &model.columns {
                         if !col.is_hidden {
                             cols.push(SelectItem::UnnamedExpr(
@@ -191,10 +192,10 @@ fn expand_wildcard(
                             ));
                         }
                     }
-                }
-                if !cols.is_empty() {
-                    new_projection.extend(cols);
-                    expanded = true;
+                    if !cols.is_empty() {
+                        new_projection.extend(cols);
+                        expanded = true;
+                    }
                 }
             }
             _ => {
@@ -206,33 +207,6 @@ fn expand_wildcard(
     if expanded {
         select.projection = new_projection;
     }
-}
-
-/// Expand a view reference in a table factor to its SQL subquery.
-fn expand_view(
-    factor: &mut TableFactor,
-    ctx: &SemanticContext,
-) -> bool {
-    if let TableFactor::Table { name, alias, .. } = factor {
-        let view_name = name_to_table_name(name);
-        if let Some(view) = ctx.views.iter().find(|v| v.name == view_name) {
-            let alias_clause = alias
-                .as_ref()
-                .map(|a| format!(" AS {}", a.name))
-                .unwrap_or_default();
-            let derived = format!("({}){}", view.statement, alias_clause);
-            *factor = TableFactor::Table {
-                name: sqlparser::ast::ObjectName(vec![
-                    sqlparser::ast::Ident::new(derived),
-                ]),
-                alias: None, args: None, with_hints: vec![],
-                version: None, partitions: vec![],
-                with_ordinality: false, json_path: None,
-            };
-            return true;
-        }
-    }
-    false
 }
 
 /// Expand a calculated field reference in a SELECT item.
@@ -305,12 +279,29 @@ fn expand_table_factor(
     factor: &mut TableFactor,
     ctx: &SemanticContext,
 ) -> Result<(), String> {
+    // View check first (before any borrows)
+    if let TableFactor::Table { name, alias, .. } = factor {
+        let view_name = name_to_table_name(name);
+        if let Some(view) = ctx.views.iter().find(|v| v.name == view_name) {
+            let alias_clause = alias
+                .as_ref()
+                .map(|a| format!(" AS {}", a.name))
+                .unwrap_or_default();
+            let derived = format!("({}){}", view.statement, alias_clause);
+            *factor = TableFactor::Table {
+                name: sqlparser::ast::ObjectName(vec![
+                    sqlparser::ast::Ident::new(derived),
+                ]),
+                alias: None, args: None, with_hints: vec![],
+                version: None, partitions: vec![],
+                with_ordinality: false, json_path: None,
+            };
+            return Ok(());
+        }
+    }
+
     match factor {
         TableFactor::Table { name, alias, .. } => {
-            // Check if this is a view first
-            if expand_view(factor, ctx) {
-                return Ok(());
-            }
             let table_name = name_to_table_name(name);
             if let Some(model) = ctx.models.iter().find(|m| m.name == table_name) {
                 // ref_sql models → wrap as derived table (subquery)
