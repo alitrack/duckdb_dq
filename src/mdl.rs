@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Full semantic context — the loaded state of a semantic project.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SemanticContext {
     pub catalog: String,
     pub schema: String,
@@ -17,6 +18,7 @@ pub struct SemanticContext {
 
 /// A logical model backed by a physical table or SQL definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Model {
     pub name: String,
     pub table_reference: Option<TableReference>,
@@ -36,6 +38,7 @@ pub struct TableReference {
 
 /// A column exposed by a model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Column {
     pub name: String,
     #[serde(rename = "type")]
@@ -55,6 +58,7 @@ pub struct Column {
 
 /// A relationship between two models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Relationship {
     pub name: String,
     pub models: Vec<String>,
@@ -94,16 +98,16 @@ mod tests {
             "schema": "main",
             "models": [{
                 "name": "customers",
-                "table_reference": {
+                "tableReference": {
                     "catalog": "test",
                     "schema": "main",
                     "table": "customers"
                 },
                 "columns": [
-                    {"name": "id", "type": "INTEGER", "is_primary_key": true},
+                    {"name": "id", "type": "INTEGER", "isPrimaryKey": true},
                     {"name": "name", "type": "VARCHAR"}
                 ],
-                "primary_key": "id"
+                "primaryKey": "id"
             }],
             "relationships": [],
             "views": []
@@ -122,11 +126,11 @@ mod tests {
             "schema": "main",
             "models": [{
                 "name": "orders",
-                "table_reference": {"table": "orders"},
+                "tableReference": {"table": "orders"},
                 "columns": [
                     {"name": "id", "type": "INTEGER"},
                     {"name": "total_with_tax", "type": "DECIMAL",
-                     "is_calculated": true,
+                     "isCalculated": true,
                      "expression": "total * 1.1"}
                 ]
             }],

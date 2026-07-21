@@ -165,7 +165,7 @@ fn expand_wildcard(
     select: &mut sqlparser::ast::Select,
     model_map: &std::collections::HashMap<String, &crate::mdl::Model>,
 ) {
-    use sqlparser::ast::WildcardAdditionalOptions;
+    use sqlparser::ast::SelectItem;
     let mut new_projection: Vec<SelectItem> = Vec::new();
     let mut expanded = false;
 
@@ -352,16 +352,6 @@ fn expand_table_factor(
 fn name_to_table_name(name: &ObjectName) -> String {
     name.0.last().map(|i| i.value.clone()).unwrap_or_default()
 }
-
-/// Quote an identifier for SQL output.
-fn ident(s: &str) -> String {
-    if s.contains(' ') || s.contains('-') || s.chars().any(|c| c.is_uppercase()) {
-        format!("\"{}\"", s)
-    } else {
-        s.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,3 @@
 /target
+configure/venv
 *.duckdb_extension
-.vscode/
-.idea/
