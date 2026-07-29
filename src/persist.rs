@@ -113,7 +113,7 @@ impl Snapshot {
 
 /// Capture the current state from all global stores into a snapshot.
 pub fn capture() -> Result<Snapshot, String> {
-    use crate::mdl;
+    
     use crate::graph;
     use crate::ontology;
     use crate::process;

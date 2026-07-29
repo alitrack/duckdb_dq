@@ -150,8 +150,19 @@ impl SemGraph {
                 let (u, v) = self.graph.edge_endpoints(ei)?;
                 let from = self.idx_to_name.get(&u)?.clone();
                 let to = self.idx_to_name.get(&v)?.clone();
-                let cond = self.graph[ei].clone();
+                let cond = self.graph.edge_weight(ei)?.clone();
                 Some((from, to, cond))
+            })
+            .collect()
+    }
+
+    /// Return all model names with their out-degree (number of outgoing edges).
+    pub fn node_degrees(&self) -> Vec<(String, i32)> {
+        self.name_to_idx
+            .iter()
+            .map(|(name, idx)| {
+                let degree = self.graph.neighbors(*idx).count() as i32;
+                (name.clone(), degree)
             })
             .collect()
     }

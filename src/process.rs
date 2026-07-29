@@ -14,7 +14,7 @@
 //!   semantic_pattern_search(query, k)                   → table: text search
 
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// A single step in a workflow pattern.
@@ -149,14 +149,10 @@ impl PatternDiscovery {
 
     /// Hub nodes: models with the highest degree in the FK graph.
     pub fn hubs(graph: &crate::graph::SemGraph, top_k: usize) -> Vec<(String, i32)> {
-        let mut degree: HashMap<String, i32> = HashMap::new();
-
-        // We can't easily iterate edges from SemGraph's petgraph, so use the discover
-        // method on all known models as a proxy. A simpler approach: count connections
-        // from graph's internal structure via the public API.
-        // For now, return empty — will be populated when we have the graph reference.
-        let hubs: Vec<(String, i32)> = degree.into_iter().collect();
-        hubs.into_iter().take(top_k).collect()
+        let mut degrees = graph.node_degrees();
+        degrees.sort_by(|a, b| b.1.cmp(&a.1)); // descending by degree
+        degrees.truncate(top_k);
+        degrees
     }
 }
 
