@@ -156,8 +156,11 @@ impl Ontology {
         if let Some(m) = self.mappings.iter().find(|m| m.class_name == class_name) {
             return Some(m.clone());
         }
-        // Walk ancestors
-        for ancestor in self.ancestors(class_name) {
+        // Walk ancestors — sorted by depth (nearest first)
+        let mut chain: Vec<String> = self.ancestors(class_name);
+        // Reverse: BFS gives farthest first, we want nearest
+        chain.reverse();
+        for ancestor in chain {
             if let Some(m) = self.mappings.iter().find(|m| m.class_name == ancestor) {
                 return Some(m.clone());
             }

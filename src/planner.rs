@@ -180,13 +180,13 @@ fn expand_wildcard(
                     new_projection.push(item.clone());
                     continue;
                 }
-                for (_key, model) in model_map.iter() {
+                for (alias, model) in model_map.iter() {
                     let mut cols: Vec<SelectItem> = Vec::new();
                     for col in &model.columns {
                         if !col.is_hidden {
                             cols.push(SelectItem::UnnamedExpr(
                                 sqlparser::ast::Expr::CompoundIdentifier(vec![
-                                    sqlparser::ast::Ident::new(&model.name),
+                                    sqlparser::ast::Ident::new(alias),
                                     sqlparser::ast::Ident::new(&col.name),
                                 ]),
                             ));

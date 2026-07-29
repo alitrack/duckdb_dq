@@ -931,7 +931,7 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             // Mine paths from FK graph
             if let Ok(g) = graph::get_graph().lock() {
                 // Build edge list from graph concepts
-                let edges: Vec<(String, String)> = Vec::new(); // placeholder
+                let edges: Vec<(String, String)> = g.edges().into_iter().map(|(a, b, _)| (a, b)).collect();
                 let paths = process::PatternDiscovery::frequent_paths(&edges, &g, 3, 10);
                 for (path, freq) in paths {
                     rows.push((path.join(" → "), freq, "frequent-path".into()));
@@ -1042,8 +1042,9 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
                 } else { 0.30 };
                 match vectors::parse_vec(&qv) {
                     Ok(qvec) => {
-                        let hub = None;
-                        let results: Vec<_> = fusion::hybrid_search(&qvec, k, dw, bw, gw, bq.as_deref(), hub)
+                        // Hub model not yet tracked — pass None for now
+                        let hub: Option<String> = None;
+                        let results: Vec<_> = fusion::hybrid_search(&qvec, k, dw, bw, gw, bq.as_deref(), hub.as_deref())
                             .into_iter()
                             .map(|r| (r.model_name, r.dense_score, r.bm25_score, r.graph_score, r.fused_score))
                             .collect();
