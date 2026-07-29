@@ -11,10 +11,11 @@
 //!   semantic_bm25_remove_doc(doc_id)         → remove one document
 //!   semantic_bm25_reset()                    → clear all indexes
 //!   semantic_bm25_search(query, k)           → table: doc_id, score
-
+use rust_stemmers::{Algorithm, Stemmer};
+use jieba_rs::Jieba;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use rust_stemmers::{Algorithm, Stemmer};
+use once_cell::sync::Lazy;
 
 // ─── Inverted index ─────────────────────────────────────────────────────
 
@@ -39,6 +40,9 @@ pub struct Bm25Index {
     /// Optional stemmer for language-specific stemming.
     #[allow(dead_code)]
     stemmer: Option<Stemmer>,
+    /// Chinese tokenizer (lazy init).
+    #[allow(dead_code)]
+    jieba: Lazy<Jieba>,
 }
 
 /// BM25 parameters.
@@ -47,13 +51,18 @@ const B: f32 = 0.75;
 
 impl Bm25Index {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            stemmer: None,
+            jieba: Lazy::new(Jieba::new),
+            ..Default::default()
+        }
     }
 
     /// New index with an English Porter stemmer.
     pub fn with_english_stemmer() -> Self {
         Self {
             stemmer: Some(Stemmer::create(Algorithm::English)),
+            jieba: Lazy::new(Jieba::new),
             ..Default::default()
         }
     }
@@ -76,25 +85,54 @@ impl Bm25Index {
         self.total_len = 0;
     }
 
-    /// Tokenize text: lowercase, split on non-alphanumeric, optional stemming.
-    fn tokenize_inner(text: &str, stemmer: Option<&Stemmer>) -> Vec<String> {
-        let tokens: Vec<String> = text
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty() && t.len() >= 2)
-            .map(|t| {
-                if let Some(s) = stemmer {
-                    s.stem(t).to_string()
-                } else {
-                    t.to_string()
+    /// Returns true if text contains CJK (Chinese/Japanese/Korean) characters.
+    fn has_cjk(text: &str) -> bool {
+        text.chars().any(|c| {
+            matches!(c,
+                '\u{4E00}'..='\u{9FFF}' | // CJK Unified Ideographs
+                '\u{3400}'..='\u{4DBF}' | // CJK Extension A
+                '\u{3040}'..='\u{309F}' | // Hiragana
+                '\u{30A0}'..='\u{30FF}' | // Katakana
+                '\u{AC00}'..='\u{D7AF}'   // Hangul Syllables
+            )
+        })
+    }
+
+    /// Tokenize text: lowercase, split on non-alphanumeric.
+    /// For CJK text (Chinese/Japanese/Korean), uses jieba segmenter.
+    /// For other text, splits on whitespace/punctuation with optional stemming.
+    fn tokenize_inner(text: &str, stemmer: Option<&Stemmer>, jieba: &Jieba) -> Vec<String> {
+        let mut tokens = Vec::new();
+
+        // Split text into segments: CJK runs vs non-CJK runs
+        if Self::has_cjk(text) {
+            // Use jieba for CJK text
+            for word in jieba.cut(text, true) {
+                let w = word.trim().to_lowercase();
+                if !w.is_empty() && w.len() >= 1 {
+                    tokens.push(w);
                 }
-            })
-            .collect();
+            }
+        } else {
+            // Standard tokenizer: lowercase, split on non-alphanumeric
+            tokens = text
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty() && t.len() >= 2)
+                .map(|t| {
+                    if let Some(s) = stemmer {
+                        s.stem(t).to_string()
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .collect();
+        }
         tokens
     }
 
     fn tokenize(&self, text: &str) -> Vec<String> {
-        Self::tokenize_inner(text, self.stemmer.as_ref())
+        Self::tokenize_inner(text, self.stemmer.as_ref(), &self.jieba)
     }
 
     /// Index a single document by (id, text).
@@ -264,7 +302,8 @@ mod tests {
     #[test]
     fn tokenize_basic() {
         let idx = Bm25Index::new();
-        let tokens = Bm25Index::tokenize_inner("Hello, World! DuckDB is great.", None);
+        let jieba = Jieba::new();
+        let tokens = Bm25Index::tokenize_inner("Hello, World! DuckDB is great.", None, &jieba);
         assert!(tokens.contains(&"hello".to_string()));
         assert!(tokens.contains(&"world".to_string()));
         assert!(tokens.contains(&"duckdb".to_string()));
