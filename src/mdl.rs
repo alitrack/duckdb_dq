@@ -83,6 +83,11 @@ pub fn load_mdl_json(input: &str) -> Result<SemanticContext, String> {
         input.to_string()
     };
 
+    // Safety: limit JSON size to 100MB
+    const MAX_JSON_SIZE: usize = 100 * 1024 * 1024;
+    if content.len() > MAX_JSON_SIZE {
+        return Err(format!("MDL JSON too large: {} bytes (max {})", content.len(), MAX_JSON_SIZE));
+    }
     serde_json::from_str::<SemanticContext>(&content)
         .map_err(|e| format!("Invalid MDL JSON: {}", e))
 }
