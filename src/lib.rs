@@ -1012,11 +1012,12 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
         }).build()?;
     unsafe { let _ = con.register_table(bm_tf); }
 
-    // ── P0: semantic_hybrid_search(query_vec, k, dw?, gw?, bq?, bw?) → table ──
+    // ── P0: semantic_hybrid_search(query_vec, k, dw?, gw?, bq?, bw?, hub?) → table ──
     let hy_tf = TableFunctionBuilder::new("semantic_hybrid_search")
         .param(TypeId::Varchar).param(TypeId::Integer)
         .param(TypeId::Float).param(TypeId::Float)
         .param(TypeId::Varchar).param(TypeId::Float)
+        .param(TypeId::Varchar)
         .with_state::<HybridState, _>(|bind| {
             bind.add_result_column("model_name", TypeId::Varchar);
             bind.add_result_column("dense_score", TypeId::Float);
@@ -1040,14 +1041,18 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
                 let bw = if bind.parameter_count() >= 6 {
                     unsafe { bind.get_parameter_value(5) }.as_f64_or(0.30) as f32
                 } else { 0.30 };
+                let hub = if bind.parameter_count() >= 7 {
+                    let s = unsafe { bind.get_parameter_value(6) }.as_str().unwrap_or_default();
+                    if s.is_empty() { None } else { Some(s) }
+                } else { None };
                 match vectors::parse_vec(&qv) {
                     Ok(qvec) => {
-                        // Hub model not yet tracked — pass None for now
-                        let hub: Option<String> = None;
-                        let results: Vec<_> = fusion::hybrid_search(&qvec, k, dw, bw, gw, bq.as_deref(), hub.as_deref())
-                            .into_iter()
-                            .map(|r| (r.model_name, r.dense_score, r.bm25_score, r.graph_score, r.fused_score))
-                            .collect();
+                        let results: Vec<_> = fusion::hybrid_search(
+                            &qvec, k, dw, bw, gw, bq.as_deref(), hub.as_deref(),
+                        )
+                        .into_iter()
+                        .map(|r| (r.model_name, r.dense_score, r.bm25_score, r.graph_score, r.fused_score))
+                        .collect();
                         Ok(HybridState { results, cursor: 0 })
                     }
                     Err(_) => Ok(HybridState::default()),

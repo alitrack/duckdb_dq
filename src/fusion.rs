@@ -5,7 +5,7 @@
 //! dense+sparse+graph pattern, implemented natively in Rust.
 //!
 //! Function:
-//!   semantic_hybrid_search(query_vec, k, dw?, gw?, bm25_query?, bw?)
+//!   semantic_hybrid_search(query_vec, k, dw?, gw?, bm25_query?, bw?, hub?)
 //!     → table: model_name, dense_score, bm25_score, graph_score, fused_score
 
 use crate::vectors;
