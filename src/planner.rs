@@ -106,6 +106,9 @@ fn collect_model_name(
 }
 
 /// Auto-inject JOINs for implicit cross-joins.
+/// When `FROM a, b` is found and there's a relationship `a → b`,
+/// this injects `b` as a JOIN onto `a`'s TableWithJoins and removes
+/// the standalone `b` from the FROM list.
 fn inject_relationship_joins(
     select: &mut sqlparser::ast::Select,
     ctx: &SemanticContext,
@@ -114,40 +117,79 @@ fn inject_relationship_joins(
     if ctx.relationships.is_empty() || models_in_from.len() < 2 {
         return Ok(());
     }
+    let mut models_to_remove: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     for rel in &ctx.relationships {
-        if rel.models.len() != 2 { continue; }
+        if rel.models.len() != 2 {
+            continue;
+        }
         let a = &rel.models[0];
         let b = &rel.models[1];
-        if models_in_from.contains(a) && models_in_from.contains(b) {
-            let already_joined = select.from.iter().any(|twj| {
-                twj.joins.iter().any(|j| {
-                    if let TableFactor::Table { name, .. } = &j.relation {
-                        let n = name_to_table_name(name);
-                        n == *b || n == *a
-                    } else { false }
-                })
-            });
-            if !already_joined {
-                if let Some(twj) = select.from.first_mut() {
-                    let join_expr = parse_join_condition(&rel.condition)?;
-                    twj.joins.push(sqlparser::ast::Join {
-                        relation: sqlparser::ast::TableFactor::Table {
-                            name: sqlparser::ast::ObjectName(vec![
-                                sqlparser::ast::Ident::new(b),
-                            ]),
-                            alias: None, args: None, with_hints: vec![],
-                            version: None, partitions: vec![],
-                            with_ordinality: false, json_path: None,
-                        },
-                        join_operator: sqlparser::ast::JoinOperator::Inner(
-                            sqlparser::ast::JoinConstraint::On(join_expr),
-                        ),
-                        global: false,
-                    });
+        if !models_in_from.contains(a) || !models_in_from.contains(b) {
+            continue;
+        }
+        // Already handled this target?
+        if models_to_remove.contains(b) || models_to_remove.contains(a) {
+            continue;
+        }
+        let already_joined = select.from.iter().any(|twj| {
+            twj.joins.iter().any(|j| {
+                if let TableFactor::Table { name, .. } = &j.relation {
+                    let n = name_to_table_name(name);
+                    n == *b || n == *a
+                } else {
+                    false
                 }
+            })
+        });
+        if already_joined {
+            continue;
+        }
+
+        // Find the FROM slot that carries model `a` — that's where we attach
+        // the JOIN for `b`.
+        let a_idx = select.from.iter().position(|twj| {
+            if let TableFactor::Table { name, .. } = &twj.relation {
+                name_to_table_name(name) == *a
+            } else {
+                false
             }
+        });
+
+        if let Some(idx) = a_idx {
+            let join_expr = parse_join_condition(&rel.condition)?;
+            select.from[idx].joins.push(sqlparser::ast::Join {
+                relation: sqlparser::ast::TableFactor::Table {
+                    name: sqlparser::ast::ObjectName(vec![sqlparser::ast::Ident::new(b)]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    partitions: vec![],
+                    with_ordinality: false,
+                    json_path: None,
+                },
+                join_operator: sqlparser::ast::JoinOperator::Inner(
+                    sqlparser::ast::JoinConstraint::On(join_expr),
+                ),
+                global: false,
+            });
+            models_to_remove.insert(b.clone());
         }
     }
+
+    // Drop standalone FROM entries that have been folded into JOINs.
+    if !models_to_remove.is_empty() {
+        select.from.retain(|twj| {
+            if let TableFactor::Table { name, .. } = &twj.relation {
+                !models_to_remove.contains(&name_to_table_name(name))
+            } else {
+                true
+            }
+        });
+    }
+
     Ok(())
 }
 
@@ -529,10 +571,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
-
-    #[test]
     fn expand_with_relationship_join() {
         let mut ctx = make_ctx();
         ctx.relationships.push(crate::mdl::Relationship {
@@ -551,6 +589,21 @@ mod tests {
         assert!(result.contains("JOIN"));
         assert!(result.contains("customers.id = orders.customer_id"));
         assert!(result.contains("my_db.public.customers"));
+        // The joined table should be in a JOIN clause, NOT as a
+        // comma-separated FROM entry (no stray ", orders" after the FROM).
+        // Check: count "FROM" occurrences — there should be exactly one.
+        let from_count = result.matches("FROM").count();
+        assert_eq!(
+            from_count, 1,
+            "should have exactly one FROM clause, got {}: {}",
+            from_count, result
+        );
+        // The JOIN should include the relationship condition.
+        assert!(
+            result.contains("JOIN orders ON"),
+            "orders should appear in a JOIN ... ON clause, not as a comma entry: {}",
+            result
+        );
     }
 
     #[test]
