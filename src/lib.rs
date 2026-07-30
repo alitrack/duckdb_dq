@@ -44,6 +44,7 @@ mod graph;
 mod ontology;
 mod process;
 mod persist;
+mod ddl;
 mod fusion;
 mod bm25;
 
@@ -583,6 +584,52 @@ struct HybridState {
     cursor: usize,
 }
 
+// ─── DDL scalar functions ────────────────────────────────────────────────
+
+unsafe extern "C" fn semantic_create_view_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let r0 = unsafe { VectorReader::new(input, 0) };
+    let mut w = unsafe { VectorWriter::new(output) };
+    if r0.row_count() == 0 || unsafe { !r0.is_valid(0) } {
+        unsafe { w.write_str(0, "Error: no input") };
+        return;
+    }
+    let ddl_text = unsafe { r0.read_str(0).to_string() };
+    match ddl::parse_ddl(&ddl_text) {
+        Ok(view) => {
+            let name = view.name.clone();
+            if let Ok(mut views) = ddl::get_views().lock() {
+                views.insert(name.clone(), view);
+                unsafe { w.write_str(0, &format!("Created semantic view '{}'", name)) };
+            }
+        }
+        Err(e) => unsafe { w.write_str(0, &format!("Error: {}", e)) },
+    }
+}
+
+unsafe extern "C" fn semantic_view_expand_fn(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let r0 = unsafe { VectorReader::new(input, 0) };
+    let r1 = unsafe { VectorReader::new(input, 1) };
+    let r2 = unsafe { VectorReader::new(input, 2) };
+    let mut w = unsafe { VectorWriter::new(output) };
+    let view_name = unsafe { r0.read_str(0).to_string() };
+    let dims_str = unsafe { r1.read_str(0).to_string() };
+    let mets_str = unsafe { r2.read_str(0).to_string() };
+    let dims: Vec<String> = dims_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let mets: Vec<String> = mets_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    match ddl::expand_view(&view_name, &dims, &mets) {
+        Ok(sql) => unsafe { w.write_str(0, &sql) },
+        Err(e) => unsafe { w.write_str(0, &format!("Error: {}", e)) },
+    }
+}
+
 // ─── Extension registration ─────────────────────────────────────────────
 
 fn register(con: &Connection) -> Result<(), ExtensionError> {
@@ -1011,6 +1058,19 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             state.cursor += 1; Ok(())
         }).build()?;
     unsafe { let _ = con.register_table(bm_tf); }
+
+    // ── DDL: semantic_create_view + semantic_view_expand ──
+    unsafe {
+        ScalarFunctionBuilder::new("semantic_create_view")
+            .param(TypeId::Varchar).returns(TypeId::Varchar)
+            .function(semantic_create_view_fn).register(raw_con)?;
+    }
+    unsafe {
+        ScalarFunctionBuilder::new("semantic_view_expand")
+            .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+            .returns(TypeId::Varchar)
+            .function(semantic_view_expand_fn).register(raw_con)?;
+    }
 
     // ── P0: semantic_hybrid_search(query_vec, k, dw?, gw?, bq?, bw?, hub?) → table ──
     let hy_tf = TableFunctionBuilder::new("semantic_hybrid_search")
