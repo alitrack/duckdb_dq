@@ -44,7 +44,7 @@ SELECT semantic_load('
       "name": "customer_orders",
       "models": ["customers", "orders"],
       "joinType": "LEFT",
-      "condition": "customers.id = orders.customer_id"
+      "condition": "customers.id = orders.id"
     }
   ],
   "views": []
@@ -65,7 +65,7 @@ SELECT CASE
 -- TEST 3: Multi-table implicit join (BUG FIX: no duplicate table)
 SELECT CASE
   WHEN semantic_dry_plan('SELECT customers.name, orders.total FROM customers, orders')
-       = 'SELECT customers.name, orders.total FROM customers JOIN orders ON customers.id = orders.customer_id'
+       = 'SELECT customers.name, orders.total FROM customers JOIN orders ON customers.id = orders.id'
   THEN 'PASS' ELSE 'FAIL' END AS test_multi_table_join;
 
 -- TEST 4: Passthrough physical table

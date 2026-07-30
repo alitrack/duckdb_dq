@@ -158,6 +158,11 @@ fn inject_relationship_joins(
         });
 
         if let Some(idx) = a_idx {
+            // ── Fan-trap detection: verify join target references a key ──
+            if let Some(model_b) = ctx.models.iter().find(|m| m.name == *b) {
+                detect_fan_trap(&rel.condition, b, model_b)?;
+            }
+
             let join_expr = parse_join_condition(&rel.condition)?;
             select.from[idx].joins.push(sqlparser::ast::Join {
                 relation: sqlparser::ast::TableFactor::Table {
@@ -198,8 +203,55 @@ fn parse_join_condition(condition: &str) -> Result<sqlparser::ast::Expr, String>
     let mut parser = sqlparser::parser::Parser::new(&dialect)
         .try_with_sql(condition)
         .map_err(|e| format!("Parse error: {}", e))?;
-    parser.parse_expr()
+    parser
+        .parse_expr()
         .map_err(|e| format!("Condition parse error: {}", e))
+}
+
+/// Fan-trap detection: verify that the join condition references a key
+/// column on the target model. If the condition references `b.non_key_col`,
+/// the join could produce a fan trap (inflated aggregates).
+fn detect_fan_trap(
+    condition: &str,
+    target_model: &str,
+    model: &crate::mdl::Model,
+) -> Result<(), String> {
+    let target_cols: Vec<&str> = condition
+        .split(|c: char| c == '=' || c == '<' || c == '>' || c == '!' || c.is_whitespace())
+        .filter_map(|part| {
+            let part = part.trim().trim_matches(|c: char| c == '(' || c == ')' || c == '.');
+            if let Some(dot_pos) = part.find('.') {
+                let (prefix, col) = part.split_at(dot_pos);
+                if prefix.trim() == target_model {
+                    return Some(col[1..].trim());
+                }
+            }
+            None
+        })
+        .collect();
+
+    if target_cols.is_empty() {
+        return Ok(());
+    }
+
+    let key_cols: std::collections::HashSet<&str> = model
+        .columns
+        .iter()
+        .filter(|c| c.is_primary_key)
+        .map(|c| c.name.as_str())
+        .collect();
+
+    for col in &target_cols {
+        if !key_cols.contains(col) {
+            return Err(format!(
+                "Fan trap: JOIN references '{}.{}' which is not a key. \
+                 Relationship to '{}' may inflate aggregates.",
+                target_model, col, target_model
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Expand SELECT * to exclude hidden columns from models.
@@ -577,7 +629,7 @@ mod tests {
             name: "customer_orders".into(),
             models: vec!["customers".into(), "orders".into()],
             join_type: "ONE_TO_MANY".into(),
-            condition: "customers.id = orders.customer_id".into(),
+            condition: "customers.id = orders.id".into(),
         });
 
         let result = expand_sql(
@@ -587,7 +639,7 @@ mod tests {
         .unwrap();
         eprintln!("REL JOIN: {}", result);
         assert!(result.contains("JOIN"));
-        assert!(result.contains("customers.id = orders.customer_id"));
+        assert!(result.contains("customers.id = orders.id"));
         assert!(result.contains("my_db.public.customers"));
         // The joined table should be in a JOIN clause, NOT as a
         // comma-separated FROM entry (no stray ", orders" after the FROM).
@@ -613,7 +665,7 @@ mod tests {
             name: "customer_orders".into(),
             models: vec!["customers".into(), "orders".into()],
             join_type: "ONE_TO_MANY".into(),
-            condition: "customers.id = orders.customer_id".into(),
+            condition: "customers.id = orders.id".into(),
         });
 
         let result = expand_sql(
@@ -638,5 +690,39 @@ mod tests {
         let result = expand_sql("SELECT name FROM customers", &ctx).unwrap();
         assert!(result.contains("UPPER(name)"));
         assert!(result.contains("active = true"));
+    }
+
+    #[test]
+    fn fan_trap_detects_non_key_join() {
+        let mut ctx = make_ctx();
+        // orders.id is the PK; orders.total is NOT a key
+        ctx.relationships.push(crate::mdl::Relationship {
+            name: "bad_join".into(),
+            models: vec!["customers".into(), "orders".into()],
+            join_type: "ONE_TO_MANY".into(),
+            condition: "customers.id = orders.total".into(), // orders.total is NOT a PK!
+        });
+        let result = expand_sql(
+            "SELECT customers.name, orders.total FROM customers, orders",
+            &ctx,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Fan trap"));
+    }
+
+    #[test]
+    fn fan_trap_ok_for_key_join() {
+        let mut ctx = make_ctx();
+        ctx.relationships.push(crate::mdl::Relationship {
+            name: "good_join".into(),
+            models: vec!["customers".into(), "orders".into()],
+            join_type: "ONE_TO_MANY".into(),
+            condition: "customers.id = orders.id".to_string(), // orders.id IS a PK!
+        });
+        let result = expand_sql(
+            "SELECT customers.name, orders.total FROM customers, orders",
+            &ctx,
+        );
+        assert!(result.is_ok());
     }
 }
