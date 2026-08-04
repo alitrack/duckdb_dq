@@ -9,6 +9,14 @@ description = "Semantic layer extension for DuckDB — expand modeled SQL agains
 name = "semantic"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Backend selection for the BM25 full-text index.
+# default = handrolled (lightweight pure-Rust inverted index + jieba-rs)
+# `tantivy` = tantivy engine (+ tantivy-jieba): phrase queries, better scale
+default = ["handrolled"]
+handrolled = []
+tantivy = ["dep:tantivy", "dep:tantivy-jieba"]
+
 [dependencies]
 quack-rs = { version = "0.15", features = ["duckdb-1-5"] }
 libduckdb-sys = { version = ">=1.5.4, <2", features = ["loadable-extension"] }
@@ -19,6 +27,8 @@ once_cell = "1"
 petgraph = "0.6"
 rust-stemmers = "1.2"
 jieba-rs = "0.7"
+tantivy = { version = "0.26.1", optional = true }
+tantivy-jieba = { version = "0.20", optional = true }
 
 [profile.release]
 panic = "abort"

@@ -1,8 +1,11 @@
-//! BM25 (Okapi) full-text search index.
+//! BM25 (Okapi) full-text search index — hand-rolled backend (default).
 //!
 //! Pure-Rust implementation of the Okapi BM25 ranking function.
 //! Stores an inverted index (term → doc_id → term frequency) and
 //! supports incremental add/remove without full rebuild.
+//!
+//! Chinese/Japanese/Korean text is segmented with jieba-rs; other text
+//! is split on whitespace/punctuation with optional stemming.
 //!
 //! Parameters: k1 = 1.2, b = 0.75 (standard).
 //!
@@ -11,11 +14,13 @@
 //!   semantic_bm25_remove_doc(doc_id)         → remove one document
 //!   semantic_bm25_reset()                    → clear all indexes
 //!   semantic_bm25_search(query, k)           → table: doc_id, score
-use rust_stemmers::{Algorithm, Stemmer};
 use jieba_rs::Jieba;
+use rust_stemmers::{Algorithm, Stemmer};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
+
+use super::Bm25Snapshot;
 
 // ─── Inverted index ─────────────────────────────────────────────────────
 
@@ -33,6 +38,8 @@ pub struct Bm25Index {
     pub inverted: HashMap<String, BTreeMap<String, u32>>,
     /// doc_id → stats
     docs: HashMap<String, DocStats>,
+    /// doc_id → raw text (kept for snapshot export/rebuild).
+    doc_texts: HashMap<String, String>,
     /// Total number of documents.
     doc_count: usize,
     /// Sum of all document lengths.
@@ -50,6 +57,9 @@ const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
 impl Bm25Index {
+    /// Plain index (no stemmer). Public API / tests; the global store
+    /// uses [`with_english_stemmer`](Bm25Index::with_english_stemmer).
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             stemmer: None,
@@ -81,6 +91,7 @@ impl Bm25Index {
     pub fn reset(&mut self) {
         self.inverted.clear();
         self.docs.clear();
+        self.doc_texts.clear();
         self.doc_count = 0;
         self.total_len = 0;
     }
@@ -161,6 +172,7 @@ impl Bm25Index {
             doc_id.to_string(),
             DocStats { len },
         );
+        self.doc_texts.insert(doc_id.to_string(), text.to_string());
         self.doc_count += 1;
         self.total_len += len;
     }
@@ -170,6 +182,7 @@ impl Bm25Index {
         if let Some(stats) = self.docs.remove(doc_id) {
             self.doc_count -= 1;
             self.total_len -= stats.len;
+            self.doc_texts.remove(doc_id);
             // Remove from inverted index
             for posting in self.inverted.values_mut() {
                 posting.remove(doc_id);
@@ -250,38 +263,32 @@ impl Bm25Index {
         self.doc_count
     }
 
-    /// Export index state for snapshot.
+    /// Export index state for snapshot (doc ids + raw texts for rebuild).
     pub fn export(&self) -> Bm25Snapshot {
+        let texts: Vec<(String, String)> = self
+            .docs
+            .keys()
+            .filter_map(|id| {
+                self.doc_texts
+                    .get(id)
+                    .map(|t| (id.clone(), t.clone()))
+            })
+            .collect();
         Bm25Snapshot {
-            inverted: self.inverted.clone(),
-            docs: self.docs.keys().cloned().collect(),
+            docs: texts.iter().map(|(id, _)| id.clone()).collect(),
+            texts,
             doc_count: self.doc_count,
             total_len: self.total_len,
         }
     }
 
-    /// Import from snapshot.
+    /// Import from snapshot — rebuilds the index from stored texts.
     pub fn import(&mut self, snap: &Bm25Snapshot) {
         self.reset();
-        self.inverted = snap.inverted.clone();
-        for id in &snap.docs {
-            // Reconstruct minimal doc stats — we lose exact lengths but
-            // keep the index functional. Real lengths are reconstructed
-            // on next indexing cycle.
-            self.docs.insert(id.clone(), DocStats { len: 1 });
+        for (id, text) in &snap.texts {
+            self.index_doc(id, text);
         }
-        self.doc_count = snap.doc_count;
-        self.total_len = snap.total_len;
     }
-}
-
-/// Serializable snapshot of the BM25 index.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Bm25Snapshot {
-    pub inverted: HashMap<String, BTreeMap<String, u32>>,
-    pub docs: Vec<String>,
-    pub doc_count: usize,
-    pub total_len: usize,
 }
 
 // ─── Global BM25 store ──────────────────────────────────────────────────

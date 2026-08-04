@@ -15,6 +15,8 @@ use std::sync::Mutex;
 pub struct ViewTable {
     pub alias: String,
     pub table_name: String,
+    /// Reserved — currently unused in this crate.
+    #[allow(dead_code)]
     pub primary_key: Vec<String>,
 }
 
