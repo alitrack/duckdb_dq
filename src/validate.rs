@@ -277,6 +277,98 @@ pub fn run_rules(table: &str, rules_json: &str) -> Vec<AssertionResult> {
                     error: err,
                 }
             }
+            "expect_table_column_count_between" => {
+                let min = params.get("min").and_then(|v| v.as_i64()).unwrap_or(0);
+                let max = params.get("max").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+                let esc = table.replace('\'', "''");
+                let (ncols, err) = match run_query_rows(&format!(
+                    "SELECT COUNT(*) FROM duckdb_columns() WHERE table_name = '{}'",
+                    esc
+                )) {
+                    Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => (
+                        rows[0][0].parse::<i64>().unwrap_or(-1),
+                        String::new(),
+                    ),
+                    Ok(_) => (0, "no rows returned".into()),
+                    Err(e) => (0, e.to_string()),
+                };
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: String::new(),
+                    passed: err.is_empty() && ncols >= min && ncols <= max,
+                    row_count: ncols,
+                    failed_count: if err.is_empty() && (ncols < min || ncols > max) { 1 } else { 0 },
+                    error: err,
+                }
+            }
+            rule_str @ ("expect_column_min_to_be_between"
+            | "expect_column_max_to_be_between"
+            | "expect_column_mean_to_be_between"
+            | "expect_column_stddev_to_be_between"
+            | "expect_column_sum_to_be_between"
+            | "expect_column_distinct_count_to_be_between") => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let lo = params.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
+                let hi = params.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                let agg = match rule_str {
+                    "expect_column_min_to_be_between" => format!("MIN({})", col),
+                    "expect_column_max_to_be_between" => format!("MAX({})", col),
+                    "expect_column_mean_to_be_between" => format!("AVG({})", col),
+                    "expect_column_stddev_to_be_between" => format!("STDDEV({})", col),
+                    "expect_column_sum_to_be_between" => format!("SUM({})", col),
+                    _ => format!("COUNT(DISTINCT {})", col),
+                };
+                let sql = format!("SELECT COUNT(*), {} FROM {}", agg, table);
+                let (total, val, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+                        (total, v, String::new())
+                    }
+                    Ok(_) => (0, f64::NAN, "no rows returned".into()),
+                    Err(e) => (0, f64::NAN, e.to_string()),
+                };
+                let passed = err.is_empty() && !val.is_nan() && val >= lo && val <= hi;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: err,
+                }
+            }
+            "expect_column_to_be_of_type" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let expected = params.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                let esc = |s: &str| s.replace('\'', "''");
+                let (actual, err) = match run_query_rows(&format!(
+                    "SELECT data_type FROM duckdb_columns() WHERE table_name = '{}' AND column_name = '{}'",
+                    esc(table),
+                    esc(col)
+                )) {
+                    Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => (rows[0][0].clone(), String::new()),
+                    Ok(_) => (String::new(), format!("column {}.{} not found", table, col)),
+                    Err(e) => (String::new(), e.to_string()),
+                };
+                let norm = |s: &str| s.trim().to_uppercase();
+                let passed = err.is_empty() && norm(&actual) == norm(expected);
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: 0,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: if err.is_empty() && !passed {
+                        format!("actual type {} != expected {}", actual, expected)
+                    } else {
+                        err
+                    },
+                }
+            }
             _ => AssertionResult {
                 rule: rule.clone(),
                 table: table.into(),

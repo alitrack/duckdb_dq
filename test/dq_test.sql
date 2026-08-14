@@ -64,3 +64,38 @@ SELECT * FROM dq_reports();
 -- 10. error case: bad table
 SELECT '10. expect on missing table' AS test;
 SELECT * FROM expect_not_null('no_such_table', 'id');
+
+-- 11. statistical assertions
+SELECT '11. expect_min_between(amount, 0, 1000) — FAIL (min = -10)' AS test;
+SELECT * FROM expect_min_between('sales', 'amount', 0, 1000);   -- FAIL (min = -10)
+SELECT '12. expect_max_between(amount, 0, 1000) — PASS (max=500)' AS test;
+SELECT * FROM expect_max_between('sales', 'amount', 0, 1000);   -- PASS
+SELECT '13. expect_mean_between(amount, 0, 1000) — PASS (mean≈163.6)' AS test;
+SELECT * FROM expect_mean_between('sales', 'amount', 0, 1000);  -- PASS
+SELECT '14. expect_sum_between(amount, 1000, 2000) — PASS (sum=1145.5)' AS test;
+SELECT * FROM expect_sum_between('sales', 'amount', 1000, 2000); -- PASS
+SELECT '15. expect_distinct_count_between(id, 1, 7) — PASS (7 distinct)' AS test;
+SELECT * FROM expect_distinct_count_between('sales', 'id', 1, 7); -- PASS
+SELECT '16. expect_stddev_between(amount, 0, 300) — PASS' AS test;
+SELECT * FROM expect_stddev_between('sales', 'amount', 0, 300);  -- PASS
+
+-- 17. schema assertions
+SELECT '17. expect_column_type(amount, DECIMAL(4,1)) — PASS' AS test;
+SELECT * FROM expect_column_type('sales', 'amount', 'DECIMAL(4,1)');
+SELECT '18. expect_column_type(amount, VARCHAR) — FAIL' AS test;
+SELECT * FROM expect_column_type('sales', 'amount', 'VARCHAR');
+SELECT '19. expect_table_column_count_between(3, 5) — PASS (3 cols)' AS test;
+SELECT * FROM expect_table_column_count_between('sales', 3, 5);  -- PASS
+SELECT '20. expect_table_column_count_between(1, 2) — FAIL (3 cols)' AS test;
+SELECT * FROM expect_table_column_count_between('sales', 1, 2);  -- FAIL
+
+-- 21. statistical rules in validate_expectations batch
+SELECT '21. validate_expectations statistical rules' AS test;
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('sales', '{
+  "expect_table_column_count_between": {"min": 3, "max": 5},
+  "expect_column_max_to_be_between": {"column": "amount", "min": 0, "max": 1000},
+  "expect_column_mean_to_be_between": {"column": "amount", "min": 0, "max": 1000},
+  "expect_column_sum_to_be_between": {"column": "amount", "min": 1000, "max": 2000},
+  "expect_column_to_be_of_type": {"column": "amount", "type": "DECIMAL(4,1)"}
+}');

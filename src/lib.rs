@@ -283,6 +283,125 @@ fn expect_relationship_bind(
     })
 }
 
+// ─── Statistical metric assertions ──────────────────────────────────────
+// expect_min_between / max / mean / stddev / sum / distinct_count:
+// compile to SELECT COUNT(*), {agg}(col) FROM table, then compare the
+// aggregate against [lo, hi]. NULL aggregate (empty table) → fail.
+
+fn metric_between_bind(
+    bind: &BindInfo,
+    rule: &str,
+    table: &str,
+    column: &str,
+    metric_expr: &str,
+    lo: f64,
+    hi: f64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = format!("SELECT COUNT(*), {} FROM {}", metric_expr, table);
+    let (total, val, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+            (total, v, String::new())
+        }
+        Ok(_) => (0, f64::NAN, "no rows returned".into()),
+        Err(e) => (0, f64::NAN, e.to_string()),
+    };
+    let passed = err.is_empty() && !val.is_nan() && val >= lo && val <= hi;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: rule.into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: total,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_column_type(table, col, expected_type) ──────────────────────
+// Compares against duckdb_columns() logical type, case-insensitively.
+
+fn expect_column_type_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    expected: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let esc = |s: &str| s.replace('\'', "''");
+    let sql = format!(
+        "SELECT data_type FROM duckdb_columns() WHERE table_name = '{}' AND column_name = '{}'",
+        esc(table),
+        esc(column)
+    );
+    let (actual, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => (rows[0][0].clone(), String::new()),
+        Ok(_) => (String::new(), format!("column {}.{} not found", table, column)),
+        Err(e) => (String::new(), e.to_string()),
+    };
+    let norm = |s: &str| s.trim().to_uppercase();
+    let passed = err.is_empty() && norm(&actual) == norm(expected);
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_column_type".into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: 0,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: if err.is_empty() && !passed {
+                format!("actual type {} != expected {}", actual, expected)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_table_column_count_between(table, lo, hi) ───────────────────
+// Asserts the number of columns in the table is within [lo, hi].
+
+fn expect_table_column_count_between_bind(
+    bind: &BindInfo,
+    table: &str,
+    lo: i64,
+    hi: i64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let esc = table.replace('\'', "''");
+    let sql = format!(
+        "SELECT COUNT(*) FROM duckdb_columns() WHERE table_name = '{}'",
+        esc
+    );
+    let (ncols, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => (
+            rows[0][0].parse::<i64>().unwrap_or(-1),
+            String::new(),
+        ),
+        Ok(_) => (0, "no rows returned".into()),
+        Err(e) => (0, e.to_string()),
+    };
+    let passed = err.is_empty() && ncols >= lo && ncols <= hi;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_table_column_count_between".into(),
+            table: table.into(),
+            column: String::new(),
+            passed,
+            row_count: ncols,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
 // ─── expect_custom_sql(table, sql) ──────────────────────────────────────
 // Fails on any row returned by the user-supplied WHERE clause.
 // The SQL receives {table} placeholder substitution.
@@ -588,6 +707,56 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
             let where_sql = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
             expect_custom_sql_bind(bind, &table, &where_sql)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // ── Statistical metric assertions (table, col, lo, hi) ──
+    // Macro: registers expect_{name}_between → metric_between_bind with agg expr.
+    macro_rules! register_metric {
+        ($fn_name:literal, $rule_name:literal, $agg:expr) => {{
+            let tf = TableFunctionBuilder::new($fn_name)
+                .param(TypeId::Varchar).param(TypeId::Varchar)
+                .param(TypeId::Double).param(TypeId::Double)
+                .with_state::<AssertionState, _>(move |bind| {
+                    let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+                    let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+                    let lo = unsafe { bind.get_parameter_value(2) }.as_f64_or(f64::MIN);
+                    let hi = unsafe { bind.get_parameter_value(3) }.as_f64_or(f64::MAX);
+                    let expr = format!($agg, column);
+                    metric_between_bind(bind, $rule_name, &table, &column, &expr, lo, hi)
+                })
+                .scan(write_assertion).build()?;
+            unsafe { let _ = con.register_table(tf); }
+        }};
+    }
+    register_metric!("expect_min_between", "expect_min_between", "MIN({})");
+    register_metric!("expect_max_between", "expect_max_between", "MAX({})");
+    register_metric!("expect_mean_between", "expect_mean_between", "AVG({})");
+    register_metric!("expect_stddev_between", "expect_stddev_between", "STDDEV({})");
+    register_metric!("expect_sum_between", "expect_sum_between", "SUM({})");
+    register_metric!("expect_distinct_count_between", "expect_distinct_count_between", "COUNT(DISTINCT {})");
+
+    // expect_column_type(table, col, expected_type)
+    let tf = TableFunctionBuilder::new("expect_column_type")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let expected = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            expect_column_type_bind(bind, &table, &column, &expected)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_table_column_count_between(table, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_table_column_count_between")
+        .param(TypeId::Varchar).param(TypeId::BigInt).param(TypeId::BigInt)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let lo = unsafe { bind.get_parameter_value(1) }.as_i64_or(0);
+            let hi = unsafe { bind.get_parameter_value(2) }.as_i64_or(i64::MAX);
+            expect_table_column_count_between_bind(bind, &table, lo, hi)
         })
         .scan(write_assertion).build()?;
     unsafe { let _ = con.register_table(tf); }

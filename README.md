@@ -14,6 +14,14 @@ Data quality assertion framework for DuckDB — SQL-native `expect_*` rules, pro
 | `expect_match_regex(table, column, pattern)` | table | Fails on NULL / values not matching regex |
 | `expect_relationship(table, column, to_table, to_column)` | table | Fails on orphan values (broken FK) |
 | `expect_custom_sql(table, where_clause)` | table | Fails on rows returned by custom WHERE (supports `{table}`) |
+| `expect_min_between(table, column, lo, hi)` | table | Fails if MIN(column) outside [lo, hi] |
+| `expect_max_between(table, column, lo, hi)` | table | Fails if MAX(column) outside [lo, hi] |
+| `expect_mean_between(table, column, lo, hi)` | table | Fails if AVG(column) outside [lo, hi] |
+| `expect_stddev_between(table, column, lo, hi)` | table | Fails if STDDEV(column) outside [lo, hi] |
+| `expect_sum_between(table, column, lo, hi)` | table | Fails if SUM(column) outside [lo, hi] |
+| `expect_distinct_count_between(table, column, lo, hi)` | table | Fails if COUNT(DISTINCT column) outside [lo, hi] |
+| `expect_column_type(table, column, type)` | table | Fails if column's logical type ≠ expected |
+| `expect_table_column_count_between(table, lo, hi)` | table | Fails if table column count outside [lo, hi] |
 | `profile_table(table)` | table | Per-column profiling (count, null %, distinct, min, max) |
 | `validate_expectations(table, json_rules)` | table | Batch assertions from a JSON rule set |
 | `dq_run(name, table, json_rules)` | scalar | Run rule set, persist one report row, return summary |
@@ -88,10 +96,12 @@ Test locally:
 ## Roadmap
 
 - [x] Core assertions (not_null / unique / in_range / row_count_between)
+- [x] Statistical assertions (min / max / mean / stddev / sum / distinct_count)
+- [x] Schema assertions (column type / table column count)
 - [x] profile_table (SUMMARIZE-based)
 - [x] validate_expectations JSON batch engine
 - [x] dq_run + dq_reports persistence
-- [ ] 20+ more assertions (min/max/mean/stddev, set membership, custom SQL)
+- [ ] 20+ more assertions (nullability rates, uniqueness %, quantiles)
 - [ ] duckdb_dash quality dashboard
 - [ ] Federated sources via duckdb_universal (cross-DB quality baselines)
 
