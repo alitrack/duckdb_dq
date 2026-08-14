@@ -31,3 +31,4 @@ jobs:
         with:
           name: dq-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/libdq.so
+          retention-days: 7
