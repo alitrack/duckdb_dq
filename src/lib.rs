@@ -522,6 +522,134 @@ fn columns_unique_together_bind(
     })
 }
 
+// ─── GX-parity assertions ──────────────────────────────────────────────
+// expect_column_length_between(table, col, lo, hi): every non-null
+//   LENGTH(col) within [lo, hi] (GX: expect_column_value_lengths_to_be_between)
+// expect_null_count_between(table, col, lo, hi): NULL row count in [lo, hi]
+// expect_row_count_to_equal(table, n): exact row count match
+
+fn column_length_between_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    lo: i64,
+    hi: i64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = format!(
+        "SELECT COUNT(*), COUNT({}), MIN(LENGTH({})), MAX(LENGTH({})) FROM {}",
+        column, column, column, table
+    );
+    let (total, checked, min_len, max_len, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 4 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let checked = rows[0][1].parse::<i64>().unwrap_or(-1);
+            let min_len = rows[0][2].parse::<i64>().unwrap_or(i64::MAX);
+            let max_len = rows[0][3].parse::<i64>().unwrap_or(i64::MIN);
+            (total, checked, min_len, max_len, String::new())
+        }
+        Ok(_) => (0, 0, i64::MAX, i64::MIN, "no rows returned".into()),
+        Err(e) => (0, 0, i64::MAX, i64::MIN, e.to_string()),
+    };
+    let passed = err.is_empty() && min_len >= lo && max_len <= hi;
+    let failed = if err.is_empty() {
+        let bad_lo = if min_len < lo { min_len } else { 0 };
+        let bad_hi = if max_len > hi { max_len } else { 0 };
+        bad_lo + bad_hi
+    } else {
+        0
+    };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_column_length_between".into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: total,
+            failed_count: failed,
+            error: if err.is_empty() && !passed {
+                format!("length range [{}, {}] not within [{}, {}] (checked {} rows)", min_len, max_len, lo, hi, checked)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+fn null_count_between_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    lo: i64,
+    hi: i64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = format!(
+        "SELECT COUNT(*), COUNT(*) - COUNT({}) FROM {}",
+        column, table
+    );
+    let (total, nulls, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let nulls = rows[0][1].parse::<i64>().unwrap_or(-1);
+            (total, nulls, String::new())
+        }
+        Ok(_) => (0, 0, "no rows returned".into()),
+        Err(e) => (0, 0, e.to_string()),
+    };
+    let passed = err.is_empty() && nulls >= lo && nulls <= hi;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_null_count_between".into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: total,
+            failed_count: if err.is_empty() && !passed { nulls } else { 0 },
+            error: if err.is_empty() && !passed {
+                format!("null count {} not within [{}, {}]", nulls, lo, hi)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+fn row_count_to_equal_bind(
+    bind: &BindInfo,
+    table: &str,
+    expected: i64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let (total, err) = match run_query_rows(&format!("SELECT COUNT(*) FROM {}", table)) {
+        Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => (
+            rows[0][0].parse::<i64>().unwrap_or(-1),
+            String::new(),
+        ),
+        Ok(_) => (0, "no rows returned".into()),
+        Err(e) => (0, e.to_string()),
+    };
+    let passed = err.is_empty() && total == expected;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_row_count_to_equal".into(),
+            table: table.into(),
+            column: String::new(),
+            passed,
+            row_count: total,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: if err.is_empty() && !passed {
+                format!("row count {} != expected {}", total, expected)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
 // ─── expect_custom_sql(table, sql) ──────────────────────────────────────
 // Fails on any row returned by the user-supplied WHERE clause.
 // The SQL receives {table} placeholder substitution.
@@ -924,6 +1052,46 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             let c1 = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
             let c2 = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
             columns_unique_together_bind(bind, &table, &[c1, c2])
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // ── GX-parity assertions ──
+    // expect_column_length_between(table, col, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_column_length_between")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .param(TypeId::BigInt).param(TypeId::BigInt)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let lo = unsafe { bind.get_parameter_value(2) }.as_i64_or(0);
+            let hi = unsafe { bind.get_parameter_value(3) }.as_i64_or(i64::MAX);
+            column_length_between_bind(bind, &table, &column, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_null_count_between(table, col, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_null_count_between")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .param(TypeId::BigInt).param(TypeId::BigInt)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let lo = unsafe { bind.get_parameter_value(2) }.as_i64_or(0);
+            let hi = unsafe { bind.get_parameter_value(3) }.as_i64_or(i64::MAX);
+            null_count_between_bind(bind, &table, &column, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_row_count_to_equal(table, n)
+    let tf = TableFunctionBuilder::new("expect_row_count_to_equal")
+        .param(TypeId::Varchar).param(TypeId::BigInt)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let expected = unsafe { bind.get_parameter_value(1) }.as_i64_or(-1);
+            row_count_to_equal_bind(bind, &table, expected)
         })
         .scan(write_assertion).build()?;
     unsafe { let _ = con.register_table(tf); }

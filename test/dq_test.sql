@@ -127,3 +127,35 @@ FROM validate_expectations('sales', '{
   "expect_column_quantile_to_be_between": {"column": "amount", "quantile": 0.5, "min": 0, "max": 300},
   "expect_columns_unique_together": {"columns": ["id", "order_date"]}
 }');
+
+-- 28. GX-parity: string length
+CREATE OR REPLACE TABLE names AS
+SELECT * FROM (VALUES ('alice'), ('bob'), (NULL), ('charlie')) t(name);
+SELECT '28. expect_column_length_between(name, 2, 7) — PASS (len 3..7)' AS test;
+SELECT * FROM expect_column_length_between('names', 'name', 2, 7);   -- PASS
+SELECT '29. expect_column_length_between(name, 4, 7) — FAIL (bob=3)' AS test;
+SELECT * FROM expect_column_length_between('names', 'name', 4, 7);   -- FAIL
+
+-- 30. GX-parity: null count
+SELECT '30. expect_null_count_between(amount, 0, 2) — PASS (1 null)' AS test;
+SELECT * FROM expect_null_count_between('sales', 'amount', 0, 2);    -- PASS
+SELECT '31. expect_null_count_between(amount, 2, 5) — FAIL (1 null)' AS test;
+SELECT * FROM expect_null_count_between('sales', 'amount', 2, 5);    -- FAIL
+
+-- 32. GX-parity: exact row count
+SELECT '32. expect_row_count_to_equal(sales, 8) — PASS' AS test;
+SELECT * FROM expect_row_count_to_equal('sales', 8);                 -- PASS
+SELECT '33. expect_row_count_to_equal(sales, 10) — FAIL' AS test;
+SELECT * FROM expect_row_count_to_equal('sales', 10);                -- FAIL
+
+-- 34. GX-parity rules in validate_expectations batch
+SELECT '34. validate_expectations GX-parity rules' AS test;
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('sales', '{
+  "expect_column_null_count_to_be_between": {"column": "amount", "min": 0, "max": 2},
+  "expect_table_row_count_to_equal": {"value": 8}
+}');
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('names', '{
+  "expect_column_value_lengths_to_be_between": {"column": "name", "min_length": 2, "max_length": 7}
+}');

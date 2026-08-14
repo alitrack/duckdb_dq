@@ -26,6 +26,9 @@ Data quality assertion framework for DuckDB — SQL-native `expect_*` rules, pro
 | `expect_unique_proportion_between(table, column, lo, hi)` | table | Fails if distinct ratio outside [lo, hi] |
 | `expect_quantile_between(table, column, q, lo, hi)` | table | Fails if quantile_cont(col, q) outside [lo, hi] |
 | `expect_columns_unique_together(table, col1, col2)` | table | Fails if (col1, col2) tuple has duplicates |
+| `expect_column_length_between(table, column, lo, hi)` | table | Fails if any non-null value length outside [lo, hi] |
+| `expect_null_count_between(table, column, lo, hi)` | table | Fails if NULL row count outside [lo, hi] |
+| `expect_row_count_to_equal(table, n)` | table | Fails if table row count ≠ n |
 | `profile_table(table)` | table | Per-column profiling (count, null %, distinct, min, max) |
 | `validate_expectations(table, json_rules)` | table | Batch assertions from a JSON rule set |
 | `dq_run(name, table, json_rules)` | scalar | Run rule set, persist one report row, return summary |
@@ -104,10 +107,11 @@ Test locally:
 - [x] Schema assertions (column type / table column count)
 - [x] Proportion + quantile assertions (null % / unique % / quantile_cont)
 - [x] Composite uniqueness (columns_unique_together)
+- [x] GX-parity (string length / null count / exact row count)
 - [x] profile_table (SUMMARIZE-based)
 - [x] validate_expectations JSON batch engine
 - [x] dq_run + dq_reports persistence
-- [ ] 25+ assertions (GX full parity: string length, dates, null count)
+- [ ] 25+ assertions (GX full parity: date formats, string matching, set membership)
 - [ ] duckdb_dash quality dashboard
 - [ ] Federated sources via duckdb_universal (cross-DB quality baselines)
 

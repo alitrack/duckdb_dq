@@ -472,6 +472,93 @@ pub fn run_rules(table: &str, rules_json: &str) -> Vec<AssertionResult> {
                     }
                 }
             }
+            "expect_column_value_lengths_to_be_between" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let lo = params.get("min_length").and_then(|v| v.as_i64()).unwrap_or(0);
+                let hi = params.get("max_length").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+                let sql = format!(
+                    "SELECT COUNT(*), COUNT({}), MIN(LENGTH({})), MAX(LENGTH({})) FROM {}",
+                    col, col, col, table
+                );
+                let (total, min_len, max_len, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 4 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let min_len = rows[0][2].parse::<i64>().unwrap_or(i64::MAX);
+                        let max_len = rows[0][3].parse::<i64>().unwrap_or(i64::MIN);
+                        (total, min_len, max_len, String::new())
+                    }
+                    Ok(_) => (0, i64::MAX, i64::MIN, "no rows returned".into()),
+                    Err(e) => (0, i64::MAX, i64::MIN, e.to_string()),
+                };
+                let passed = err.is_empty() && min_len >= lo && max_len <= hi;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: if err.is_empty() && !passed {
+                        format!("length range [{}, {}] not within [{}, {}]", min_len, max_len, lo, hi)
+                    } else {
+                        err
+                    },
+                }
+            }
+            "expect_column_null_count_to_be_between" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let lo = params.get("min").and_then(|v| v.as_i64()).unwrap_or(0);
+                let hi = params.get("max").and_then(|v| v.as_i64()).unwrap_or(i64::MAX);
+                let sql = format!("SELECT COUNT(*), COUNT(*) - COUNT({}) FROM {}", col, table);
+                let (total, nulls, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let nulls = rows[0][1].parse::<i64>().unwrap_or(-1);
+                        (total, nulls, String::new())
+                    }
+                    Ok(_) => (0, 0, "no rows returned".into()),
+                    Err(e) => (0, 0, e.to_string()),
+                };
+                let passed = err.is_empty() && nulls >= lo && nulls <= hi;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { nulls } else { 0 },
+                    error: if err.is_empty() && !passed {
+                        format!("null count {} not within [{}, {}]", nulls, lo, hi)
+                    } else {
+                        err
+                    },
+                }
+            }
+            "expect_table_row_count_to_equal" => {
+                let expected = params.get("value").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let (total, err) = match run_query_rows(&format!("SELECT COUNT(*) FROM {}", table)) {
+                    Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => (
+                        rows[0][0].parse::<i64>().unwrap_or(-1),
+                        String::new(),
+                    ),
+                    Ok(_) => (0, "no rows returned".into()),
+                    Err(e) => (0, e.to_string()),
+                };
+                let passed = err.is_empty() && total == expected;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: String::new(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: if err.is_empty() && !passed {
+                        format!("row count {} != expected {}", total, expected)
+                    } else {
+                        err
+                    },
+                }
+            }
             _ => AssertionResult {
                 rule: rule.clone(),
                 table: table.into(),
