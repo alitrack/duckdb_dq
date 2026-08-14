@@ -193,6 +193,90 @@ pub fn run_rules(table: &str, rules_json: &str) -> Vec<AssertionResult> {
                     error: err,
                 }
             }
+            "expect_column_values_to_be_in_set" | "expect_column_values_to_be_in" => {
+                // accepted_values: values: ["a","b","c"]
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let values: Vec<String> = params
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if values.is_empty() {
+                    AssertionResult {
+                        rule: rule.clone(),
+                        table: table.into(),
+                        column: col.into(),
+                        passed: false,
+                        row_count: 0,
+                        failed_count: 0,
+                        error: "values list is empty".into(),
+                    }
+                } else {
+                    let quoted: Vec<String> = values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
+                    let cond = format!("{} IS NULL OR {} NOT IN ({})", col, col, quoted.join(", "));
+                    let (total, matched, err) = count_rows(table, Some(&cond));
+                    AssertionResult {
+                        rule: rule.clone(),
+                        table: table.into(),
+                        column: col.into(),
+                        passed: err.is_empty() && matched == 0,
+                        row_count: total,
+                        failed_count: matched,
+                        error: err,
+                    }
+                }
+            }
+            "expect_column_values_to_match_regex" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let pat = params.get("pattern").and_then(|v| v.as_str()).unwrap_or_default().replace('\'', "''");
+                let cond = format!(
+                    "{} IS NULL OR NOT regexp_matches(CAST({} AS VARCHAR), '{}')",
+                    col, col, pat
+                );
+                let (total, matched, err) = count_rows(table, Some(&cond));
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed: err.is_empty() && matched == 0,
+                    row_count: total,
+                    failed_count: matched,
+                    error: err,
+                }
+            }
+            "expect_column_values_to_exist_in_table" | "expect_column_relationship" => {
+                // relationship: to_table, to_column (orphan check)
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let to_table = params.get("to_table").and_then(|v| v.as_str()).unwrap_or_default();
+                let to_col = params.get("to_column").and_then(|v| v.as_str()).unwrap_or_default();
+                let cond = format!(
+                    "{} IS NOT NULL AND {} NOT IN (SELECT {} FROM {})",
+                    col, col, to_col, to_table
+                );
+                let (total, matched, err) = count_rows(table, Some(&cond));
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed: err.is_empty() && matched == 0,
+                    row_count: total,
+                    failed_count: matched,
+                    error: err,
+                }
+            }
+            "expect_custom_sql" => {
+                let where_sql = params.get("sql").and_then(|v| v.as_str()).unwrap_or_default().replace("{table}", table);
+                let (total, matched, err) = count_rows(table, Some(&where_sql));
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: String::new(),
+                    passed: err.is_empty() && matched == 0,
+                    row_count: total,
+                    failed_count: matched,
+                    error: err,
+                }
+            }
             _ => AssertionResult {
                 rule: rule.clone(),
                 table: table.into(),

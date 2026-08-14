@@ -177,6 +177,139 @@ fn expect_row_count_between_bind(
     })
 }
 
+// ─── expect_accepted_values(table, col, 'a,b,c') ────────────────────────
+// Fails on NULL or values outside the allowed set.
+
+fn expect_accepted_values_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    values_csv: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let values: Vec<&str> = values_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if values.is_empty() {
+        return Ok(AssertionState {
+            results: vec![AssertionResult {
+                rule: "expect_accepted_values".into(),
+                table: table.into(),
+                column: column.into(),
+                passed: false,
+                row_count: 0,
+                failed_count: 0,
+                error: "values list is empty".into(),
+            }],
+            cursor: 0,
+        });
+    }
+    let quoted: Vec<String> = values.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect();
+    let cond = format!("{} IS NULL OR {} NOT IN ({})", column, column, quoted.join(", "));
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    let (row_count, failed) = if err.is_empty() { (total, matched) } else { (0, 0) };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_accepted_values".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && failed == 0,
+            row_count,
+            failed_count: failed,
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_match_regex(table, col, pattern) ────────────────────────────
+// Fails on NULL or values not matching the regex (DuckDB regexp_matches).
+
+fn expect_match_regex_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    pattern: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let pat = pattern.replace('\'', "''");
+    let cond = format!(
+        "{} IS NULL OR NOT regexp_matches(CAST({} AS VARCHAR), '{}')",
+        column, column, pat
+    );
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    let (row_count, failed) = if err.is_empty() { (total, matched) } else { (0, 0) };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_match_regex".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && failed == 0,
+            row_count,
+            failed_count: failed,
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_relationship(table, col, to_table, to_col) ──────────────────
+// Fails on values in col that have no matching key in to_table.to_col
+// (orphan / broken foreign-key check).
+
+fn expect_relationship_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    to_table: &str,
+    to_col: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let cond = format!(
+        "{} IS NOT NULL AND {} NOT IN (SELECT {} FROM {})",
+        column, column, to_col, to_table
+    );
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    let (row_count, failed) = if err.is_empty() { (total, matched) } else { (0, 0) };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_relationship".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && failed == 0,
+            row_count,
+            failed_count: failed,
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_custom_sql(table, sql) ──────────────────────────────────────
+// Fails on any row returned by the user-supplied WHERE clause.
+// The SQL receives {table} placeholder substitution.
+
+fn expect_custom_sql_bind(
+    bind: &BindInfo,
+    table: &str,
+    where_sql: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = where_sql.replace("{table}", table);
+    let (total, matched, err) = count_rows(table, Some(&sql));
+    let (row_count, failed) = if err.is_empty() { (total, matched) } else { (0, 0) };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_custom_sql".into(),
+            table: table.into(),
+            column: String::new(),
+            passed: err.is_empty() && failed == 0,
+            row_count,
+            failed_count: failed,
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
 // ─── profile_table(table) → SUMMARIZE ───────────────────────────────────
 
 #[derive(Default)]
@@ -407,6 +540,54 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             let lo = unsafe { bind.get_parameter_value(1) }.as_i64_or(0);
             let hi = unsafe { bind.get_parameter_value(2) }.as_i64_or(i64::MAX);
             expect_row_count_between_bind(bind, &table, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_accepted_values(table, col, 'a,b,c')
+    let tf = TableFunctionBuilder::new("expect_accepted_values")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let values = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            expect_accepted_values_bind(bind, &table, &column, &values)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_match_regex(table, col, pattern)
+    let tf = TableFunctionBuilder::new("expect_match_regex")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let pattern = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            expect_match_regex_bind(bind, &table, &column, &pattern)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_relationship(table, col, to_table, to_col)
+    let tf = TableFunctionBuilder::new("expect_relationship")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let to_table = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            let to_col = unsafe { bind.get_parameter_value(3) }.as_str().unwrap_or_default().to_string();
+            expect_relationship_bind(bind, &table, &column, &to_table, &to_col)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_custom_sql(table, where_clause)
+    let tf = TableFunctionBuilder::new("expect_custom_sql")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let where_sql = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            expect_custom_sql_bind(bind, &table, &where_sql)
         })
         .scan(write_assertion).build()?;
     unsafe { let _ = con.register_table(tf); }

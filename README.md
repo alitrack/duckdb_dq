@@ -10,6 +10,10 @@ Data quality assertion framework for DuckDB — SQL-native `expect_*` rules, pro
 | `expect_unique(table, column)` | table | Fails if duplicate values in column |
 | `expect_in_range(table, column, lo, hi)` | table | Fails on NULL / below lo / above hi |
 | `expect_row_count_between(table, lo, hi)` | table | Fails if row count outside [lo, hi] |
+| `expect_accepted_values(table, column, 'a,b,c')` | table | Fails on NULL / values outside allowed set |
+| `expect_match_regex(table, column, pattern)` | table | Fails on NULL / values not matching regex |
+| `expect_relationship(table, column, to_table, to_column)` | table | Fails on orphan values (broken FK) |
+| `expect_custom_sql(table, where_clause)` | table | Fails on rows returned by custom WHERE (supports `{table}`) |
 | `profile_table(table)` | table | Per-column profiling (count, null %, distinct, min, max) |
 | `validate_expectations(table, json_rules)` | table | Batch assertions from a JSON rule set |
 | `dq_run(name, table, json_rules)` | scalar | Run rule set, persist one report row, return summary |
@@ -24,6 +28,12 @@ LOAD 'dq.duckdb_extension';
 SELECT * FROM expect_not_null('sales', 'amount');
 -- rule | table_name | column_name | passed | row_count | failed_count | error
 
+-- Enumerated values, regex, foreign keys, custom SQL
+SELECT * FROM expect_accepted_values('customers', 'status', 'active,inactive,suspended');
+SELECT * FROM expect_match_regex('customers', 'email', '^[^@]+@[^@]+\\.com$');
+SELECT * FROM expect_relationship('orders', 'customer_id', 'customers', 'id');
+SELECT * FROM expect_custom_sql('orders', 'amount < 0');
+
 -- Profiling
 SELECT * FROM profile_table('sales');
 
@@ -33,7 +43,9 @@ SELECT * FROM validate_expectations('sales', '{
   "expect_column_values_not_null":    {"column": "order_id"},
   "expect_column_values_unique":      {"column": "order_id"},
   "expect_column_values_in_range":    {"column": "amount", "min": 0, "max": 100000},
-  "expect_column_values_match_regex": {"column": "email", "pattern": "^[^@]+@[^@]+$"}
+  "expect_column_values_match_regex": {"column": "email", "pattern": "^[^@]+@[^@]+$"},
+  "expect_column_relationship":       {"column": "customer_id", "to_table": "customers", "to_column": "id"},
+  "expect_custom_sql":                {"sql": "{table}.amount < 0"}
 }');
 
 -- Run + persist a named quality check
