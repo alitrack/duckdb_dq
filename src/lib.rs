@@ -653,7 +653,6 @@ fn row_count_to_equal_bind(
 // ─── expect_custom_sql(table, sql) ──────────────────────────────────────
 // Fails on any row returned by the user-supplied WHERE clause.
 // The SQL receives {table} placeholder substitution.
-
 fn expect_custom_sql_bind(
     bind: &BindInfo,
     table: &str,
@@ -672,6 +671,220 @@ fn expect_custom_sql_bind(
             row_count,
             failed_count: failed,
             error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── GX parity batch 2 ─────────────────────────────────────────────────
+// expect_not_in_set(table, col, 'a,b,c'): no value in the comma set
+// expect_not_match_regex(table, col, pattern): no value matches
+// expect_match_date_format(table, col, format): every non-null value parses
+// expect_sorted(table, col, 'asc'|'desc'): column ordered
+// expect_median_between(table, col, lo, hi): median_cont in range
+
+fn not_in_set_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    values_csv: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let values: Vec<String> = values_csv
+        .split(',')
+        .map(|s| s.trim().trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if values.is_empty() {
+        return Ok(AssertionState {
+            results: vec![AssertionResult {
+                rule: "expect_not_in_set".into(),
+                table: table.into(),
+                column: column.into(),
+                passed: false,
+                row_count: 0,
+                failed_count: 0,
+                error: "empty value set".into(),
+            }],
+            cursor: 0,
+        });
+    }
+    let quoted: Vec<String> = values
+        .iter()
+        .map(|v| format!("'{}'", v.replace('\'', "''")))
+        .collect();
+    let cond = format!("{}::VARCHAR IN ({})", column, quoted.join(", "));
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_not_in_set".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && matched == 0,
+            row_count: total,
+            failed_count: matched,
+            error: if err.is_empty() && matched > 0 {
+                format!("{} rows in forbidden set [{}]", matched, values_csv)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+fn not_match_regex_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    pattern: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let esc = pattern.replace('\'', "''");
+    let cond = format!("regexp_matches({}::VARCHAR, '{}')", column, esc);
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_not_match_regex".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && matched == 0,
+            row_count: total,
+            failed_count: matched,
+            error: if err.is_empty() && matched > 0 {
+                format!("{} rows matched forbidden pattern", matched)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+fn match_date_format_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    format: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    // try_strptime returns NULL for non-matching values → count non-null results
+    let esc_fmt = format.replace('\'', "''");
+    let cond = format!(
+        "{} IS NOT NULL AND try_strptime({}::VARCHAR, '{}') IS NULL",
+        column, column, esc_fmt
+    );
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_match_date_format".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && matched == 0,
+            row_count: total,
+            failed_count: matched,
+            error: if err.is_empty() && matched > 0 {
+                format!("{} rows failed date format '{}'", matched, format)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+fn sorted_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    direction: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let is_asc = direction.eq_ignore_ascii_case("asc");
+    if !is_asc && !direction.eq_ignore_ascii_case("desc") {
+        return Ok(AssertionState {
+            results: vec![AssertionResult {
+                rule: "expect_sorted".into(),
+                table: table.into(),
+                column: column.into(),
+                passed: false,
+                row_count: 0,
+                failed_count: 0,
+                error: format!("direction must be 'asc' or 'desc', got '{}'", direction),
+            }],
+            cursor: 0,
+        });
+    }
+    // Count adjacent inversions: subquery with LAG ordered by physical rowid
+    let cmp = if is_asc { "<" } else { ">" };
+    let sql = format!(
+        "SELECT (SELECT COUNT(*) FROM {t}), \
+         COALESCE((SELECT COUNT(*) FROM (SELECT {c} AS v, LAG({c}) OVER (ORDER BY rowid) AS prev FROM {t}) sub WHERE v {cmp} prev), 0)",
+        c = column,
+        t = table
+    );
+    let (total, bad, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let bad = rows[0][1].parse::<i64>().unwrap_or(-1);
+            (total, bad, String::new())
+        }
+        Ok(_) => (0, 0, "no rows returned".into()),
+        Err(e) => (0, 0, e.to_string()),
+    };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_sorted".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && bad == 0,
+            row_count: total,
+            failed_count: bad,
+            error: if err.is_empty() && bad > 0 {
+                format!("{} adjacent inversions ({} order)", bad, direction)
+            } else {
+                err
+            },
+        }],
+        cursor: 0,
+    })
+}
+
+fn median_between_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    lo: f64,
+    hi: f64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = format!(
+        "SELECT COUNT(*), median({}) FROM {}",
+        column, table
+    );
+    let (total, val, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+            (total, v, String::new())
+        }
+        Ok(_) => (0, f64::NAN, "no rows returned".into()),
+        Err(e) => (0, f64::NAN, e.to_string()),
+    };
+    let passed = err.is_empty() && !val.is_nan() && val >= lo && val <= hi;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_median_between".into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: total,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: if err.is_empty() && !passed {
+                format!("median {} not within [{}, {}]", val, lo, hi)
+            } else {
+                err
+            },
         }],
         cursor: 0,
     })
@@ -1092,6 +1305,69 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
             let expected = unsafe { bind.get_parameter_value(1) }.as_i64_or(-1);
             row_count_to_equal_bind(bind, &table, expected)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // ── GX parity batch 2 ──
+    // expect_not_in_set(table, col, 'a,b,c')
+    let tf = TableFunctionBuilder::new("expect_not_in_set")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let values = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            not_in_set_bind(bind, &table, &column, &values)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_not_match_regex(table, col, pattern)
+    let tf = TableFunctionBuilder::new("expect_not_match_regex")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let pattern = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            not_match_regex_bind(bind, &table, &column, &pattern)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_match_date_format(table, col, format)
+    let tf = TableFunctionBuilder::new("expect_match_date_format")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let format = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            match_date_format_bind(bind, &table, &column, &format)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_sorted(table, col, 'asc'|'desc')
+    let tf = TableFunctionBuilder::new("expect_sorted")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let direction = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            sorted_bind(bind, &table, &column, &direction)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_median_between(table, col, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_median_between")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .param(TypeId::Double).param(TypeId::Double)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let lo = unsafe { bind.get_parameter_value(2) }.as_f64_or(f64::MIN);
+            let hi = unsafe { bind.get_parameter_value(3) }.as_f64_or(f64::MAX);
+            median_between_bind(bind, &table, &column, lo, hi)
         })
         .scan(write_assertion).build()?;
     unsafe { let _ = con.register_table(tf); }

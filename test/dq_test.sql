@@ -159,3 +159,55 @@ SELECT rule, column_name, passed, row_count, failed_count, error
 FROM validate_expectations('names', '{
   "expect_column_value_lengths_to_be_between": {"column": "name", "min_length": 2, "max_length": 7}
 }');
+
+-- 35. set membership (negated)
+SELECT '35. expect_not_in_set(status, "closed,pending") — PASS (no such values)' AS test;
+CREATE OR REPLACE TABLE orders2 AS
+SELECT * FROM (VALUES ('open'), ('open'), ('cancelled'), ('shipped')) t(status);
+SELECT * FROM expect_not_in_set('orders2', 'status', 'closed,pending');  -- PASS
+SELECT '36. expect_not_in_set(status, "open,cancelled") — FAIL (3 rows)' AS test;
+SELECT * FROM expect_not_in_set('orders2', 'status', 'open,cancelled');  -- FAIL (3)
+
+-- 37. negated regex
+SELECT '37. expect_not_match_regex(name, "^b") — FAIL (bob matches)' AS test;
+SELECT * FROM expect_not_match_regex('names', 'name', '^b');            -- FAIL (1)
+SELECT '38. expect_not_match_regex(name, "^z") — PASS' AS test;
+SELECT * FROM expect_not_match_regex('names', 'name', '^z');            -- PASS
+-- 39. date format
+CREATE OR REPLACE TABLE events AS
+SELECT * FROM (VALUES ('2026-01-15'), ('2026-02-01'), ('not-a-date')) t(event_date);
+SELECT '39. expect_match_date_format(event_date, "%Y-%m-%d") — FAIL (1 bad)' AS test;
+SELECT * FROM expect_match_date_format('events', 'event_date', '%Y-%m-%d');  -- FAIL (1)
+SELECT '40. expect_match_date_format(event_date, "%Y/%m/%d") — FAIL (2 bad)' AS test;
+SELECT * FROM expect_match_date_format('events', 'event_date', '%Y/%m/%d');  -- FAIL (2)
+
+-- 41. sorted
+CREATE OR REPLACE TABLE seq AS SELECT * FROM (VALUES (1), (2), (2), (3)) t(n);
+CREATE OR REPLACE TABLE unsorted AS SELECT * FROM (VALUES (3), (1), (2)) t(n);
+SELECT '41. expect_sorted(seq, n, asc) — PASS' AS test;
+SELECT * FROM expect_sorted('seq', 'n', 'asc');                         -- PASS
+SELECT '42. expect_sorted(unsorted, n, asc) — FAIL (1 inversion)' AS test;
+SELECT * FROM expect_sorted('unsorted', 'n', 'asc');                    -- FAIL (1)
+
+-- 43. median
+SELECT '43. expect_median_between(amount, 50, 150) — PASS (median=100)' AS test;
+SELECT * FROM expect_median_between('sales', 'amount', 50, 150);        -- PASS
+SELECT '44. expect_median_between(amount, 200, 300) — FAIL (median=100)' AS test;
+SELECT * FROM expect_median_between('sales', 'amount', 200, 300);       -- FAIL
+
+-- 45. GX batch 2 rules in validate_expectations
+SELECT '45. validate_expectations GX batch 2 rules' AS test;
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('events', '{
+  "expect_column_values_to_match_strftime_format": {"column": "event_date", "strftime_format": "%Y-%m-%d"}
+}');
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('orders2', '{
+  "expect_column_values_to_not_be_in_set": {"column": "status", "value_set": ["closed", "pending"]},
+  "expect_column_values_to_be_sorted": {"column": "status", "descending": false}
+}');  -- not_in_set PASS; sorted FAIL (open,open,cancelled,shipped not ascending)
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('sales', '{
+  "expect_column_median_to_be_between": {"column": "amount", "min": 100, "max": 250},
+  "expect_column_values_to_not_match_regex": {"column": "id", "pattern": "^9"}
+}');

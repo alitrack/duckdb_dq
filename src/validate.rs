@@ -559,6 +559,154 @@ pub fn run_rules(table: &str, rules_json: &str) -> Vec<AssertionResult> {
                     },
                 }
             }
+            "expect_column_values_to_not_be_in_set" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let values: Vec<String> = params
+                    .get("value_set")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let quoted: Vec<String> = values
+                    .iter()
+                    .map(|v| format!("'{}'", v.replace('\'', "''")))
+                    .collect();
+                if quoted.is_empty() {
+                    AssertionResult {
+                        rule: rule.clone(),
+                        table: table.into(),
+                        column: col.into(),
+                        passed: false,
+                        row_count: 0,
+                        failed_count: 0,
+                        error: "empty value_set".into(),
+                    }
+                } else {
+                    let cond = format!("{}::VARCHAR IN ({})", col, quoted.join(", "));
+                    let (total, matched, err) = count_rows(table, Some(&cond));
+                    AssertionResult {
+                        rule: rule.clone(),
+                        table: table.into(),
+                        column: col.into(),
+                        passed: err.is_empty() && matched == 0,
+                        row_count: total,
+                        failed_count: matched,
+                        error: if err.is_empty() && matched > 0 {
+                            format!("{} rows in forbidden set", matched)
+                        } else {
+                            err
+                        },
+                    }
+                }
+            }
+            "expect_column_values_to_not_match_regex" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let pattern = params.get("pattern").and_then(|v| v.as_str()).unwrap_or_default();
+                let esc = pattern.replace('\'', "''");
+                let cond = format!("regexp_matches({}::VARCHAR, '{}')", col, esc);
+                let (total, matched, err) = count_rows(table, Some(&cond));
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed: err.is_empty() && matched == 0,
+                    row_count: total,
+                    failed_count: matched,
+                    error: if err.is_empty() && matched > 0 {
+                        format!("{} rows matched forbidden pattern", matched)
+                    } else {
+                        err
+                    },
+                }
+            }
+            "expect_column_values_to_match_strftime_format" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let format = params.get("strftime_format").and_then(|v| v.as_str()).unwrap_or_default();
+                let esc_fmt = format.replace('\'', "''");
+                let cond = format!(
+                    "{} IS NOT NULL AND try_strptime({}::VARCHAR, '{}') IS NULL",
+                    col, col, esc_fmt
+                );
+                let (total, matched, err) = count_rows(table, Some(&cond));
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed: err.is_empty() && matched == 0,
+                    row_count: total,
+                    failed_count: matched,
+                    error: if err.is_empty() && matched > 0 {
+                        format!("{} rows failed strptime format '{}'", matched, format)
+                    } else {
+                        err
+                    },
+                }
+            }
+            "expect_column_values_to_be_sorted" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let desc = params.get("descending").and_then(|v| v.as_bool()).unwrap_or(false);
+                let cmp = if desc { ">" } else { "<" };
+                let sql = format!(
+                    "SELECT (SELECT COUNT(*) FROM {t}), \
+                     COALESCE((SELECT COUNT(*) FROM (SELECT {c} AS v, LAG({c}) OVER (ORDER BY rowid) AS prev FROM {t}) sub WHERE v {cmp} prev), 0)",
+                    c = col,
+                    t = table
+                );
+                let (total, bad, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let bad = rows[0][1].parse::<i64>().unwrap_or(-1);
+                        (total, bad, String::new())
+                    }
+                    Ok(_) => (0, 0, "no rows returned".into()),
+                    Err(e) => (0, 0, e.to_string()),
+                };
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed: err.is_empty() && bad == 0,
+                    row_count: total,
+                    failed_count: bad,
+                    error: if err.is_empty() && bad > 0 {
+                        format!("{} adjacent inversions ({})", bad, if desc { "desc" } else { "asc" })
+                    } else {
+                        err
+                    },
+                }
+            }
+            "expect_column_median_to_be_between" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let lo = params.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
+                let hi = params.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                let sql = format!("SELECT COUNT(*), median({}) FROM {}", col, table);
+                let (total, val, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+                        (total, v, String::new())
+                    }
+                    Ok(_) => (0, f64::NAN, "no rows returned".into()),
+                    Err(e) => (0, f64::NAN, e.to_string()),
+                };
+                let passed = err.is_empty() && !val.is_nan() && val >= lo && val <= hi;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: if err.is_empty() && !passed {
+                        format!("median {} not within [{}, {}]", val, lo, hi)
+                    } else {
+                        err
+                    },
+                }
+            }
             _ => AssertionResult {
                 rule: rule.clone(),
                 table: table.into(),
