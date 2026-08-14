@@ -1021,6 +1021,137 @@ unsafe extern "C" fn dq_run_fn(
     unsafe { writer.write_str(0, &msg) };
 }
 
+// ─── dq_dashboard(table, rules_json) → table: dash-compatible JSON + summary ──
+// Runs the rule set and emits:
+//   dashboard_json  — full JSON config for duckdb_dashboard's dash_create()
+//   checks          — total rules evaluated
+//   passed          — rules passed
+//   failed          — rules failed
+//   pass_rate       — passed / checks (0.0-1.0)
+
+#[derive(Default)]
+struct DashboardState {
+    rows: Vec<(String, i64, i64, i64, f64)>,
+    cursor: usize,
+}
+
+fn dq_dashboard_bind(bind: &BindInfo, table: &str, rules_json: &str) -> Result<DashboardState, ExtensionError> {
+    bind.add_result_column("dashboard_json", TypeId::Varchar)
+        .add_result_column("checks", TypeId::BigInt)
+        .add_result_column("passed", TypeId::BigInt)
+        .add_result_column("failed", TypeId::BigInt)
+        .add_result_column("pass_rate", TypeId::Double);
+
+    let results = validate::run_rules(table, rules_json);
+    let total = results.len() as i64;
+    let passed = results.iter().filter(|r| r.error.is_empty() && r.passed).count() as i64;
+    let failed = results.iter().filter(|r| r.error.is_empty() && !r.passed).count() as i64;
+    let errors = results.iter().filter(|r| !r.error.is_empty()).count() as i64;
+    let pass_rate = if total > 0 { passed as f64 / total as f64 } else { 0.0 };
+
+    // Failed-rule rows for the table panel
+    let fail_rows: Vec<serde_json::Value> = results
+        .iter()
+        .filter(|r| !r.passed || !r.error.is_empty())
+        .map(|r| {
+            serde_json::json!([r.rule, r.column, r.row_count, r.failed_count, r.error])
+        })
+        .collect();
+
+    // Per-rule pass/fail counts for the bar panel
+    let bar_rows: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            let status = if !r.error.is_empty() {
+                "error"
+            } else if r.passed {
+                "pass"
+            } else {
+                "fail"
+            };
+            serde_json::json!([r.rule, status])
+        })
+        .collect();
+
+    let dashboard = serde_json::json!({
+        "title": format!("Data Quality — {}", table),
+        "filters": [],
+        "panels": [
+            {
+                "id": "checks",
+                "title": "Checks",
+                "type": "big_number",
+                "query": format!("SELECT {} AS v", total),
+                "grid": {"x": 0, "y": 0, "w": 2, "h": 2}
+            },
+            {
+                "id": "pass_rate",
+                "title": "Pass Rate",
+                "type": "gauge",
+                "query": format!("SELECT {} AS v", pass_rate * 100.0),
+                "grid": {"x": 2, "y": 0, "w": 2, "h": 2}
+            },
+            {
+                "id": "passed",
+                "title": "Passed",
+                "type": "big_number",
+                "query": format!("SELECT {} AS v", passed),
+                "grid": {"x": 4, "y": 0, "w": 2, "h": 2}
+            },
+            {
+                "id": "failed",
+                "title": "Failed",
+                "type": "big_number",
+                "query": format!("SELECT {} AS v", failed + errors),
+                "grid": {"x": 6, "y": 0, "w": 2, "h": 2}
+            },
+            {
+                "id": "status",
+                "title": "Per-Rule Status",
+                "type": "bar",
+                "query": format!("SELECT * FROM (VALUES {}) t(rule, status)",
+                    bar_rows.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")),
+                "grid": {"x": 0, "y": 2, "w": 6, "h": 4}
+            },
+            {
+                "id": "failures",
+                "title": "Failures",
+                "type": "table",
+                "query": if fail_rows.is_empty() {
+                    "SELECT 'none' AS rule, '' AS column, 0 AS row_count, 0 AS failed_count, '' AS error".to_string()
+                } else {
+                    format!("SELECT * FROM (VALUES {}) t(rule, column, row_count, failed_count, error)",
+                        fail_rows.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", "))
+                },
+                "grid": {"x": 6, "y": 2, "w": 6, "h": 4}
+            }
+        ]
+    });
+
+    Ok(DashboardState {
+        rows: vec![(dashboard.to_string(), total, passed, failed, pass_rate)],
+        cursor: 0,
+    })
+}
+
+fn write_dashboard(state: &mut DashboardState, chunk: &DataChunk) -> Result<(), ExtensionError> {
+    if state.cursor >= state.rows.len() {
+        unsafe { chunk.set_size(0) };
+        return Ok(());
+    }
+    let (json, checks, passed, failed, rate) = &state.rows[state.cursor];
+    unsafe {
+        chunk.writer(0).write_str(0, json);
+        chunk.writer(1).write_i64(0, *checks);
+        chunk.writer(2).write_i64(0, *passed);
+        chunk.writer(3).write_i64(0, *failed);
+        chunk.writer(4).write_f64(0, *rate);
+        chunk.set_size(1);
+    }
+    state.cursor += 1;
+    Ok(())
+}
+
 // ─── dq_reports() → table ───────────────────────────────────────────────
 
 #[derive(Default)]
@@ -1405,6 +1536,17 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
     let tf = TableFunctionBuilder::new("dq_reports")
         .with_state::<ReportsState, _>(|bind| dq_reports_bind(bind))
         .scan(reports_scan).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // dq_dashboard(table, json) → table
+    let tf = TableFunctionBuilder::new("dq_dashboard")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<DashboardState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let rules = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            dq_dashboard_bind(bind, &table, &rules)
+        })
+        .scan(write_dashboard).build()?;
     unsafe { let _ = con.register_table(tf); }
 
     Ok(())

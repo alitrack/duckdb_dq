@@ -211,3 +211,15 @@ FROM validate_expectations('sales', '{
   "expect_column_median_to_be_between": {"column": "amount", "min": 100, "max": 250},
   "expect_column_values_to_not_match_regex": {"column": "id", "pattern": "^9"}
 }');
+
+-- 46. dq_dashboard: emits dash-compatible JSON + summary metrics
+SELECT '46. dq_dashboard(table, rules) — JSON valid, metrics correct' AS test;
+SELECT checks, passed, failed, round(pass_rate::DOUBLE, 2) AS pass_rate,
+       json_valid(dashboard_json) AS json_ok,
+       (dashboard_json LIKE '%"panels"%') AS has_panels
+FROM dq_dashboard('sales', '{
+  "expect_table_row_count_between": {"min": 5, "max": 10},
+  "expect_column_values_not_null": {"column": "id"},
+  "expect_column_values_unique": {"column": "id"},
+  "expect_column_values_in_range": {"column": "amount", "min": 0, "max": 100000}
+}');  -- 4 checks; unique FAILS (7/8) + in_range FAILS (-10 < 0) → failed=2, pass_rate=0.5

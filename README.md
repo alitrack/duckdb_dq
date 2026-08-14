@@ -37,7 +37,8 @@ Data quality assertion framework for DuckDB — SQL-native `expect_*` rules, pro
 | `profile_table(table)` | table | Per-column profiling (count, null %, distinct, min, max) |
 | `validate_expectations(table, json_rules)` | table | Batch assertions from a JSON rule set |
 | `dq_run(name, table, json_rules)` | scalar | Run rule set, persist one report row, return summary |
-| `dq_reports()` | table | Persisted report history |
+| `dq_reports()` | table | Persisted run history (name, table, summary, passed, run_at) |
+| `dq_dashboard(table, json_rules)` | table | dash-compatible dashboard JSON + checks/passed/failed/pass_rate |
 
 ## Quick start
 
@@ -117,8 +118,8 @@ Test locally:
 - [x] profile_table (SUMMARIZE-based)
 - [x] validate_expectations JSON batch engine
 - [x] dq_run + dq_reports persistence
+- [x] dq_dashboard → duckdb_dashboard (dash_create-compatible JSON, verified end-to-end)
 - [ ] 30+ assertions (GX full parity: set membership of expected, match_like)
-- [ ] duckdb_dash quality dashboard
 - [ ] Federated sources via duckdb_universal (cross-DB quality baselines)
 
 ## License
