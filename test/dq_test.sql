@@ -99,3 +99,31 @@ FROM validate_expectations('sales', '{
   "expect_column_sum_to_be_between": {"column": "amount", "min": 1000, "max": 2000},
   "expect_column_to_be_of_type": {"column": "amount", "type": "DECIMAL(4,1)"}
 }');
+
+-- 22. proportion assertions
+SELECT '22. expect_null_proportion_between(amount, 0.1, 0.5) — PASS (1/8=0.125)' AS test;
+SELECT * FROM expect_null_proportion_between('sales', 'amount', 0.1, 0.5);  -- PASS
+SELECT '23. expect_unique_proportion_between(id, 0.5, 1.0) — PASS (7/8=0.875)' AS test;
+SELECT * FROM expect_unique_proportion_between('sales', 'id', 0.5, 1.0);    -- PASS
+
+-- 24. quantile assertion
+SELECT '24. expect_quantile_between(amount, 0.5, 0, 300) — PASS (median≈187.5)' AS test;
+SELECT * FROM expect_quantile_between('sales', 'amount', 0.5, 0, 300);      -- PASS
+
+-- 25. composite uniqueness: (id, order_date) unique — PASS; dup_pairs has real dup
+SELECT '25. expect_columns_unique_together(id, order_date) — PASS' AS test;
+SELECT * FROM expect_columns_unique_together('sales', 'id', 'order_date');  -- PASS
+CREATE OR REPLACE TABLE dup_pairs AS
+SELECT * FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) t(k, v);
+SELECT '26. expect_columns_unique_together(k, v) on dup_pairs — FAIL (1 dupe)' AS test;
+SELECT * FROM expect_columns_unique_together('dup_pairs', 'k', 'v');  -- FAIL (1 dupe)
+
+-- 27. proportion/quantile rules in validate_expectations batch
+SELECT '27. validate_expectations proportion rules' AS test;
+SELECT rule, column_name, passed, row_count, failed_count, error
+FROM validate_expectations('sales', '{
+  "expect_column_null_proportion_to_be_between": {"column": "amount", "min": 0.1, "max": 0.5},
+  "expect_column_unique_proportion_to_be_between": {"column": "id", "min": 0.5, "max": 1.0},
+  "expect_column_quantile_to_be_between": {"column": "amount", "quantile": 0.5, "min": 0, "max": 300},
+  "expect_columns_unique_together": {"columns": ["id", "order_date"]}
+}');

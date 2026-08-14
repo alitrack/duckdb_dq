@@ -402,6 +402,126 @@ fn expect_table_column_count_between_bind(
     })
 }
 
+// ─── Proportion assertions ──────────────────────────────────────────────
+// expect_null_proportion_between(table, col, lo, hi): NULL ratio in [lo,hi]
+// expect_unique_proportion_between(table, col, lo, hi): distinct ratio in [lo,hi]
+// expect_quantile_between(table, col, q, lo, hi): quantile_cont(col, q) in [lo,hi]
+
+fn ratio_between_bind(
+    bind: &BindInfo,
+    rule: &str,
+    table: &str,
+    column: &str,
+    is_null: bool,
+    lo: f64,
+    hi: f64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let expr = if is_null {
+        format!("SUM(CASE WHEN {} IS NULL THEN 1 ELSE 0 END)::DOUBLE / COUNT(*)", column)
+    } else {
+        format!("COUNT(DISTINCT {})::DOUBLE / COUNT(*)", column)
+    };
+    let sql = format!("SELECT COUNT(*), {} FROM {}", expr, table);
+    let (total, ratio, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+            (total, v, String::new())
+        }
+        Ok(_) => (0, f64::NAN, "no rows returned".into()),
+        Err(e) => (0, f64::NAN, e.to_string()),
+    };
+    let passed = err.is_empty() && !ratio.is_nan() && ratio >= lo && ratio <= hi;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: rule.into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: total,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+fn quantile_between_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    q: f64,
+    lo: f64,
+    hi: f64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = format!(
+        "SELECT COUNT(*), quantile_cont({}, {}) FROM {}",
+        column, q, table
+    );
+    let (total, val, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+            (total, v, String::new())
+        }
+        Ok(_) => (0, f64::NAN, "no rows returned".into()),
+        Err(e) => (0, f64::NAN, e.to_string()),
+    };
+    let passed = err.is_empty() && !val.is_nan() && val >= lo && val <= hi;
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_quantile_between".into(),
+            table: table.into(),
+            column: column.into(),
+            passed,
+            row_count: total,
+            failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_columns_unique_together(table, col1, col2, ...) ─────────────
+// Asserts the combined tuple (col1, col2, ...) has no duplicates.
+// Accepts 2..=4 columns.
+
+fn columns_unique_together_bind(
+    bind: &BindInfo,
+    table: &str,
+    cols: &[String],
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let cols_sql = cols.join(", ");
+    let sql = format!(
+        "SELECT COUNT(*), COUNT(DISTINCT ({})::VARCHAR) FROM {}",
+        cols_sql, table
+    );
+    let (total, dupes, err) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+            let distinct = rows[0][1].parse::<i64>().unwrap_or(-1);
+            (total, total - distinct, String::new())
+        }
+        Ok(_) => (0, 0, "no rows returned".into()),
+        Err(e) => (0, 0, e.to_string()),
+    };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_columns_unique_together".into(),
+            table: table.into(),
+            column: cols.join(","),
+            passed: err.is_empty() && dupes == 0,
+            row_count: total,
+            failed_count: if err.is_empty() { dupes } else { 0 },
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
 // ─── expect_custom_sql(table, sql) ──────────────────────────────────────
 // Fails on any row returned by the user-supplied WHERE clause.
 // The SQL receives {table} placeholder substitution.
@@ -757,6 +877,53 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             let lo = unsafe { bind.get_parameter_value(1) }.as_i64_or(0);
             let hi = unsafe { bind.get_parameter_value(2) }.as_i64_or(i64::MAX);
             expect_table_column_count_between_bind(bind, &table, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // ── Proportion / quantile / composite-uniqueness assertions ──
+    macro_rules! register_ratio {
+        ($fn_name:literal, $rule_name:literal, $is_null:expr) => {{
+            let tf = TableFunctionBuilder::new($fn_name)
+                .param(TypeId::Varchar).param(TypeId::Varchar)
+                .param(TypeId::Double).param(TypeId::Double)
+                .with_state::<AssertionState, _>(move |bind| {
+                    let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+                    let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+                    let lo = unsafe { bind.get_parameter_value(2) }.as_f64_or(f64::MIN);
+                    let hi = unsafe { bind.get_parameter_value(3) }.as_f64_or(f64::MAX);
+                    ratio_between_bind(bind, $rule_name, &table, &column, $is_null, lo, hi)
+                })
+                .scan(write_assertion).build()?;
+            unsafe { let _ = con.register_table(tf); }
+        }};
+    }
+    register_ratio!("expect_null_proportion_between", "expect_null_proportion_between", true);
+    register_ratio!("expect_unique_proportion_between", "expect_unique_proportion_between", false);
+
+    // expect_quantile_between(table, col, q, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_quantile_between")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .param(TypeId::Double).param(TypeId::Double).param(TypeId::Double)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let q = unsafe { bind.get_parameter_value(2) }.as_f64_or(0.5);
+            let lo = unsafe { bind.get_parameter_value(3) }.as_f64_or(f64::MIN);
+            let hi = unsafe { bind.get_parameter_value(4) }.as_f64_or(f64::MAX);
+            quantile_between_bind(bind, &table, &column, q, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_columns_unique_together(table, col1, col2) — 2 columns
+    let tf = TableFunctionBuilder::new("expect_columns_unique_together")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let c1 = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let c2 = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            columns_unique_together_bind(bind, &table, &[c1, c2])
         })
         .scan(write_assertion).build()?;
     unsafe { let _ = con.register_table(tf); }

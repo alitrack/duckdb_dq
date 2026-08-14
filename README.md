@@ -22,6 +22,10 @@ Data quality assertion framework for DuckDB — SQL-native `expect_*` rules, pro
 | `expect_distinct_count_between(table, column, lo, hi)` | table | Fails if COUNT(DISTINCT column) outside [lo, hi] |
 | `expect_column_type(table, column, type)` | table | Fails if column's logical type ≠ expected |
 | `expect_table_column_count_between(table, lo, hi)` | table | Fails if table column count outside [lo, hi] |
+| `expect_null_proportion_between(table, column, lo, hi)` | table | Fails if NULL ratio outside [lo, hi] |
+| `expect_unique_proportion_between(table, column, lo, hi)` | table | Fails if distinct ratio outside [lo, hi] |
+| `expect_quantile_between(table, column, q, lo, hi)` | table | Fails if quantile_cont(col, q) outside [lo, hi] |
+| `expect_columns_unique_together(table, col1, col2)` | table | Fails if (col1, col2) tuple has duplicates |
 | `profile_table(table)` | table | Per-column profiling (count, null %, distinct, min, max) |
 | `validate_expectations(table, json_rules)` | table | Batch assertions from a JSON rule set |
 | `dq_run(name, table, json_rules)` | scalar | Run rule set, persist one report row, return summary |
@@ -98,10 +102,12 @@ Test locally:
 - [x] Core assertions (not_null / unique / in_range / row_count_between)
 - [x] Statistical assertions (min / max / mean / stddev / sum / distinct_count)
 - [x] Schema assertions (column type / table column count)
+- [x] Proportion + quantile assertions (null % / unique % / quantile_cont)
+- [x] Composite uniqueness (columns_unique_together)
 - [x] profile_table (SUMMARIZE-based)
 - [x] validate_expectations JSON batch engine
 - [x] dq_run + dq_reports persistence
-- [ ] 20+ more assertions (nullability rates, uniqueness %, quantiles)
+- [ ] 25+ assertions (GX full parity: string length, dates, null count)
 - [ ] duckdb_dash quality dashboard
 - [ ] Federated sources via duckdb_universal (cross-DB quality baselines)
 

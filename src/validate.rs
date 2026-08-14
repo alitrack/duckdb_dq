@@ -369,6 +369,109 @@ pub fn run_rules(table: &str, rules_json: &str) -> Vec<AssertionResult> {
                     },
                 }
             }
+            "expect_column_null_proportion_to_be_between"
+            | "expect_column_unique_proportion_to_be_between" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let lo = params.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
+                let hi = params.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                let is_null = rule == "expect_column_null_proportion_to_be_between";
+                let expr = if is_null {
+                    format!("SUM(CASE WHEN {} IS NULL THEN 1 ELSE 0 END)::DOUBLE / COUNT(*)", col)
+                } else {
+                    format!("COUNT(DISTINCT {})::DOUBLE / COUNT(*)", col)
+                };
+                let sql = format!("SELECT COUNT(*), {} FROM {}", expr, table);
+                let (total, ratio, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+                        (total, v, String::new())
+                    }
+                    Ok(_) => (0, f64::NAN, "no rows returned".into()),
+                    Err(e) => (0, f64::NAN, e.to_string()),
+                };
+                let passed = err.is_empty() && !ratio.is_nan() && ratio >= lo && ratio <= hi;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: err,
+                }
+            }
+            "expect_column_quantile_to_be_between" => {
+                let col = params.get("column").and_then(|v| v.as_str()).unwrap_or_default();
+                let q = params.get("quantile").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                let lo = params.get("min").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
+                let hi = params.get("max").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                let sql = format!(
+                    "SELECT COUNT(*), quantile_cont({}, {}) FROM {}",
+                    col, q, table
+                );
+                let (total, val, err) = match run_query_rows(&sql) {
+                    Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                        let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                        let v = rows[0][1].parse::<f64>().unwrap_or(f64::NAN);
+                        (total, v, String::new())
+                    }
+                    Ok(_) => (0, f64::NAN, "no rows returned".into()),
+                    Err(e) => (0, f64::NAN, e.to_string()),
+                };
+                let passed = err.is_empty() && !val.is_nan() && val >= lo && val <= hi;
+                AssertionResult {
+                    rule: rule.clone(),
+                    table: table.into(),
+                    column: col.into(),
+                    passed,
+                    row_count: total,
+                    failed_count: if err.is_empty() && !passed { 1 } else { 0 },
+                    error: err,
+                }
+            }
+            "expect_columns_unique_together" => {
+                let cols: Vec<String> = params
+                    .get("columns")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if cols.len() < 2 {
+                    AssertionResult {
+                        rule: rule.clone(),
+                        table: table.into(),
+                        column: String::new(),
+                        passed: false,
+                        row_count: 0,
+                        failed_count: 0,
+                        error: "columns list must have at least 2 entries".into(),
+                    }
+                } else {
+                    let cols_sql = cols.join(", ");
+                    let sql = format!(
+                        "SELECT COUNT(*), COUNT(DISTINCT ({})::VARCHAR) FROM {}",
+                        cols_sql, table
+                    );
+                    let (total, dupes, err) = match run_query_rows(&sql) {
+                        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => {
+                            let total = rows[0][0].parse::<i64>().unwrap_or(-1);
+                            let distinct = rows[0][1].parse::<i64>().unwrap_or(-1);
+                            (total, total - distinct, String::new())
+                        }
+                        Ok(_) => (0, 0, "no rows returned".into()),
+                        Err(e) => (0, 0, e.to_string()),
+                    };
+                    AssertionResult {
+                        rule: rule.clone(),
+                        table: table.into(),
+                        column: cols.join(","),
+                        passed: err.is_empty() && dupes == 0,
+                        row_count: total,
+                        failed_count: if err.is_empty() { dupes } else { 0 },
+                        error: err,
+                    }
+                }
+            }
             _ => AssertionResult {
                 rule: rule.clone(),
                 table: table.into(),
