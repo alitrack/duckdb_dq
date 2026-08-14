@@ -29,5 +29,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: semantic-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/libsemantic.so
+          name: dq-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/libdq.so
