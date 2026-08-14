@@ -1,38 +1,9 @@
 extension:
-  name: semantic
-  description: "Semantic layer for DuckDB — MDL model expansion, vector search, graph relationships, ontology reasoning"
+  name: dq
+  description: Data quality assertion framework — SQL-native expect_* rules, profiling, and persisted quality reports
   version: 0.1.0
   language: Rust
-  build: cargo
   license: MIT
-  requires_toolchains: rust
   maintainers:
     - alitrack
-  excluded_platforms: "linux_arm64;wasm_eh;wasm_mvp;wasm_threads;windows_amd64_mingw;windows_amd64_rtools"
-
-repo:
-  github: alitrack/duckdb_semantic
-  ref: refs/tags/v0.1.1
-
-docs:
-  hello_world: |
-    INSTALL semantic FROM community;
-    LOAD semantic;
-    SELECT semantic_load('model.json');
-    SELECT semantic_dry_plan('SELECT name FROM customers');
-    SELECT * FROM semantic_query('SELECT name FROM customers');
-
-  extended_description: |
-    ## Semantic — Model-Driven SQL for DuckDB
-
-    Write SQL against business-meaningful model names. The extension expands
-    model references, calculated fields, and relationships into executable SQL.
-
-    **Features:**
-    - MDL model loading and SQL expansion
-    - Vector search (BM25 + cosine similarity)
-    - Graph-based relationship discovery + shortest path
-    - Ontology class hierarchy with inheritance reasoning
-    - OFN ontology export
-
-    **Platforms:** Linux x64, macOS arm64/x64, Windows x64 (MSVC).
+  repository: github.com/alitrack/duckdb_dq

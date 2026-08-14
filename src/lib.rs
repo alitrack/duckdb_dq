@@ -1,1194 +1,452 @@
-//! Semantic layer extension for DuckDB.
+//! duckdb_dq — data quality assertion framework for DuckDB.
 //!
 //! Core functions:
-//!   semantic_load(json_or_path)          → load MDL definition
-//!   semantic_dry_plan(sql)               → expand modeled SQL (no execution)
-//!   semantic_models()                    → table : list loaded models
-//!   semantic_query(sql)                  → table : expanded physical SQL
+//!   expect_not_null(table, col)          → table : null-check assertion result
+//!   expect_unique(table, col)            → table : uniqueness assertion result
+//!   expect_in_range(table, col, lo, hi)  → table : range assertion result
+//!   expect_row_count_between(t, lo, hi)  → table : row-count assertion result
+//!   profile_table(table)                 → table : per-column profiling (SUMMARIZE)
+//!   validate_expectations(table, json)   → table : batch assertions from a JSON rule set
+//!   dq_run(name, table, json)            → scalar: run rule set + persist report row
+//!   dq_reports()                         → table : persisted report history
 //!
-//! Vector search (L1 — model embeddings):
-//!   semantic_index_model(name, embed)    → index a model by vector
-//!   semantic_vector_search(query, k)     → table : top-k by cosine similarity
-//!
-//! Graph relationships (L2 — FK discovery):
-//!   semantic_graph_reset()               → clear the FK graph
-//!   semantic_graph_add_edge(a,b,cond)    → add a relationship edge
-//!   semantic_discover_relationships(m)   → table : all models reachable from m
-//!   semantic_shortest_path(a, b)         → table : JOIN path from a to b
-//!
-//! Ontology (L3 — class hierarchy + reasoning):
-//!   semantic_class_define(name, parent)   → add class to taxonomy
-//!   semantic_class_map(class, model, f?)  → map class to physical model
-//!   semantic_property_define(n,d,r,m?)    → define property w/ domain+range
-//!   semantic_class_query(class)           → table : expanded SQL for class
-//!   semantic_class_inheritance(class)     → table : is-a chain + inherited
-//!   semantic_ontology_export(format)      → scalar : OFN export
+//! All assertions compile to SQL and execute on a persistent secondary
+//! connection, so DuckDB's vectorized engine does the counting — zero
+//! per-row Rust work.
 
-use libduckdb_sys::{
-    duckdb_data_chunk, duckdb_function_info, duckdb_vector,
-};
-use once_cell::sync::OnceCell;
+use libduckdb_sys::{duckdb_data_chunk, duckdb_function_info, duckdb_vector};
 use quack_rs::connection::Connection;
 use quack_rs::entry_point_v2;
 use quack_rs::prelude::*;
 use quack_rs::scalar::ScalarFunctionBuilder;
-use quack_rs::table::TableFunctionBuilder;
+use quack_rs::table::{BindInfo, TableFunctionBuilder};
 use quack_rs::types::TypeId;
 use quack_rs::vector::{VectorReader, VectorWriter};
-use std::sync::Mutex;
 
-mod mdl;
-mod planner;
-mod vectors;
-mod graph;
-mod ontology;
-mod process;
-mod persist;
-mod ddl;
-mod fusion;
-mod bm25;
 
-use mdl::SemanticContext;
+mod engine;
+mod validate;
 
-// ─── Global state ───────────────────────────────────────────────────────
+use engine::run_query_rows;
+use validate::{AssertionResult, count_rows};
 
-static SEMANTIC_CTX: OnceCell<Mutex<Option<SemanticContext>>> = OnceCell::new();
+// ─── Assertion table result columns ─────────────────────────────────────
+// rule, table_name, column_name, passed, row_count, failed_count, error
 
-fn get_ctx() -> &'static Mutex<Option<SemanticContext>> {
-    SEMANTIC_CTX.get_or_init(|| Mutex::new(None))
+fn add_assertion_columns(bind: &BindInfo) {
+    bind.add_result_column("rule", TypeId::Varchar)
+        .add_result_column("table_name", TypeId::Varchar)
+        .add_result_column("column_name", TypeId::Varchar)
+        .add_result_column("passed", TypeId::Boolean)
+        .add_result_column("row_count", TypeId::BigInt)
+        .add_result_column("failed_count", TypeId::BigInt)
+        .add_result_column("error", TypeId::Varchar);
 }
 
-// ─── semantic_load(json_or_path) → VARCHAR ──────────────────────────────
+#[derive(Default)]
+struct AssertionState {
+    results: Vec<AssertionResult>,
+    cursor: usize,
+}
 
-unsafe extern "C" fn semantic_load_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-
-    if reader.row_count() == 0 || unsafe { !reader.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: no input") };
-        return;
+fn write_assertion(state: &mut AssertionState, chunk: &DataChunk) -> Result<(), ExtensionError> {
+    if state.cursor >= state.results.len() {
+        unsafe { chunk.set_size(0) };
+        return Ok(());
     }
-    let input_str = unsafe { reader.read_str(0).to_string() };
+    let r = &state.results[state.cursor];
+    unsafe {
+        chunk.writer(0).write_str(0, &r.rule);
+        chunk.writer(1).write_str(0, &r.table);
+        chunk.writer(2).write_str(0, &r.column);
+        chunk.writer(3).write_bool(0, r.passed);
+        chunk.writer(4).write_i64(0, r.row_count);
+        chunk.writer(5).write_i64(0, r.failed_count);
+        chunk.writer(6).write_str(0, &r.error);
+        chunk.set_size(1);
+    }
+    state.cursor += 1;
+    Ok(())
+}
 
-    match mdl::load_mdl_json(&input_str) {
-        Ok(ctx) => {
-            let count = ctx.models.len();
-            if let Ok(mut guard) = get_ctx().lock() {
-                *guard = Some(ctx);
+// ─── expect_not_null(table, col) ────────────────────────────────────────
+
+fn expect_not_null_bind(bind: &BindInfo, table: &str, column: &str) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let (total, matched, err) = count_rows(table, Some(&format!("{} IS NULL", column)));
+    let (row_count, failed) = if err.is_empty() { (total, matched) } else { (0, 0) };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_not_null".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && failed == 0,
+            row_count,
+            failed_count: failed,
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_unique(table, col) ──────────────────────────────────────────
+
+fn expect_unique_bind(bind: &BindInfo, table: &str, column: &str) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let sql = format!("SELECT COUNT(*), COUNT(DISTINCT {}) FROM {}", column, table);
+    let (total, err1) = match run_query_rows(&sql) {
+        Ok(rows) if !rows.is_empty() && rows[0].len() >= 2 => (
+            rows[0][0].parse::<i64>().unwrap_or(-1),
+            String::new(),
+        ),
+        Ok(_) => (0, format!("no rows returned for {}", sql)),
+        Err(e) => (0, e.to_string()),
+    };
+    let dupes = if err1.is_empty() {
+        match run_query_rows(&format!("SELECT COUNT(DISTINCT {}) FROM {}", column, table)) {
+            Ok(rows) if !rows.is_empty() && !rows[0].is_empty() => {
+                total - rows[0][0].parse::<i64>().unwrap_or(-1)
             }
-            unsafe {
-                writer.write_str(
-                    0,
-                    &format!(
-                        "Loaded {} models. Use semantic_query('SELECT ...') to query.",
-                        count
-                    ),
-                );
+            _ => -1,
+        }
+    } else {
+        0
+    };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_unique".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err1.is_empty() && dupes == 0,
+            row_count: total,
+            failed_count: dupes,
+            error: err1,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_in_range(table, col, lo, hi) ────────────────────────────────
+
+fn expect_in_range_bind(
+    bind: &BindInfo,
+    table: &str,
+    column: &str,
+    lo: f64,
+    hi: f64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let cond = format!("{} IS NULL OR {} < {} OR {} > {}", column, column, lo, column, hi);
+    let (total, matched, err) = count_rows(table, Some(&cond));
+    let (row_count, failed) = if err.is_empty() { (total, matched) } else { (0, 0) };
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_in_range".into(),
+            table: table.into(),
+            column: column.into(),
+            passed: err.is_empty() && failed == 0,
+            row_count,
+            failed_count: failed,
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── expect_row_count_between(table, lo, hi) ────────────────────────────
+
+fn expect_row_count_between_bind(
+    bind: &BindInfo,
+    table: &str,
+    lo: i64,
+    hi: i64,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    let (total, _, err) = count_rows(table, None);
+    Ok(AssertionState {
+        results: vec![AssertionResult {
+            rule: "expect_row_count_between".into(),
+            table: table.into(),
+            column: String::new(),
+            passed: err.is_empty() && total >= lo && total <= hi,
+            row_count: total,
+            failed_count: if err.is_empty() && (total < lo || total > hi) { 1 } else { 0 },
+            error: err,
+        }],
+        cursor: 0,
+    })
+}
+
+// ─── profile_table(table) → SUMMARIZE ───────────────────────────────────
+
+#[derive(Default)]
+struct ProfileState {
+    rows: Vec<(String, String, String, String, String, String, String)>,
+    cursor: usize,
+}
+
+fn profile_table_bind(bind: &BindInfo, table: &str) -> Result<ProfileState, ExtensionError> {
+    bind.add_result_column("column_name", TypeId::Varchar)
+        .add_result_column("column_type", TypeId::Varchar)
+        .add_result_column("count", TypeId::Varchar)
+        .add_result_column("null_pct", TypeId::Varchar)
+        .add_result_column("distinct_count", TypeId::Varchar)
+        .add_result_column("min", TypeId::Varchar)
+        .add_result_column("max", TypeId::Varchar);
+
+    let mut rows = Vec::new();
+    match run_query_rows(&format!("SUMMARIZE SELECT * FROM {}", table)) {
+        Ok(out) => {
+            // SUMMARIZE output columns (positional):
+            // [0] column_name [1] column_type [2] min [3] max [4] approx_unique
+            // [5] avg [6] std [7] q25 [8] q50 [9] q75 [10] count [11] null_percentage
+            for row in out {
+                let get = |i: usize| row.get(i).cloned().unwrap_or_default();
+                rows.push((get(0), get(1), get(10), get(11), get(4), get(2), get(3)));
             }
         }
         Err(e) => {
-            unsafe { writer.write_str(0, &format!("Error: {}", e)) };
+            rows.push((
+                format!("ERROR: {}", e),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ));
         }
     }
+    Ok(ProfileState { rows, cursor: 0 })
 }
 
-// ─── semantic_dry_plan(sql) → VARCHAR ───────────────────────────────────
+fn profile_scan(state: &mut ProfileState, chunk: &DataChunk) -> Result<(), ExtensionError> {
+    if state.cursor >= state.rows.len() {
+        unsafe { chunk.set_size(0) };
+        return Ok(());
+    }
+    let (n, t, c, np, d, mn, mx) = &state.rows[state.cursor];
+    unsafe {
+        chunk.writer(0).write_str(0, n);
+        chunk.writer(1).write_str(0, t);
+        chunk.writer(2).write_str(0, c);
+        chunk.writer(3).write_str(0, np);
+        chunk.writer(4).write_str(0, d);
+        chunk.writer(5).write_str(0, mn);
+        chunk.writer(6).write_str(0, mx);
+        chunk.set_size(1);
+    }
+    state.cursor += 1;
+    Ok(())
+}
 
-unsafe extern "C" fn semantic_dry_plan_fn(
+// ─── validate_expectations(table, json) ─────────────────────────────────
+
+fn validate_expectations_bind(
+    bind: &BindInfo,
+    table: &str,
+    rules_json: &str,
+) -> Result<AssertionState, ExtensionError> {
+    add_assertion_columns(bind);
+    Ok(AssertionState {
+        results: validate::run_rules(table, rules_json),
+        cursor: 0,
+    })
+}
+
+// ─── dq_run(name, table, json) → scalar, persists report ───────────────
+
+unsafe extern "C" fn dq_run_fn(
     _info: duckdb_function_info,
     input: duckdb_data_chunk,
     output: duckdb_vector,
 ) {
-    let reader = unsafe { VectorReader::new(input, 0) };
+    // One reader per parameter vector — read_str(i) indexes ROWS within a
+    // single vector, NOT across parameter vectors.
+    let reader0 = unsafe { VectorReader::new(input, 0) };
+    let reader1 = unsafe { VectorReader::new(input, 1) };
+    let reader2 = unsafe { VectorReader::new(input, 2) };
     let mut writer = unsafe { VectorWriter::new(output) };
-
-    if reader.row_count() == 0 || unsafe { !reader.is_valid(0) } {
+    if reader0.row_count() == 0 || unsafe { !reader0.is_valid(0) } {
         unsafe { writer.write_str(0, "Error: no input") };
         return;
     }
-    let sql = unsafe { reader.read_str(0).to_string() };
+    let name = unsafe { reader0.read_str(0).to_string() };
+    let table = unsafe { reader1.read_str(0).to_string() };
+    let rules_json = unsafe { reader2.read_str(0).to_string() };
 
-    let result = if let Ok(guard) = get_ctx().lock() {
-        match guard.as_ref() {
-            Some(ctx) => planner::expand_sql(&sql, ctx),
-            None => Err("No MDL loaded. Run semantic_load() first.".into()),
-        }
-    } else {
-        Err("Internal lock error".into())
+    let results = validate::run_rules(&table, &rules_json);
+    let passed = results.iter().filter(|r| r.error.is_empty() && r.passed).count();
+    let failed = results.iter().filter(|r| r.error.is_empty() && !r.passed).count();
+    let errors = results.iter().filter(|r| !r.error.is_empty()).count();
+    let total = results.len();
+    let passed_all = failed == 0 && errors == 0;
+
+    let summary = serde_json::json!({
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+    });
+    let esc = |s: &str| s.replace('\'', "''");
+    let insert_sql = format!(
+        "CREATE TABLE IF NOT EXISTS dq_reports(name VARCHAR, table_name VARCHAR, rules VARCHAR, summary VARCHAR, passed BOOLEAN, run_at TIMESTAMP DEFAULT now()); \
+         INSERT INTO dq_reports(name, table_name, rules, summary, passed) VALUES ('{}', '{}', '{}', '{}', {})",
+        esc(&name),
+        esc(&table),
+        esc(&rules_json),
+        esc(&summary.to_string()),
+        if passed_all { "true" } else { "false" },
+    );
+    let msg = match engine::run_exec(&insert_sql) {
+        Ok(()) => format!(
+            "dq_run '{}': {}/{} passed, {} failed, {} errors",
+            name, passed, total, failed, errors
+        ),
+        Err(e) => format!("dq_run '{}' failed: {}", name, e),
     };
-
-    match result {
-        Ok(expanded) => unsafe { writer.write_str(0, &expanded) },
-        Err(e) => unsafe { writer.write_str(0, &format!("Error: {}", e)) },
-    }
+    unsafe { writer.write_str(0, &msg) };
 }
 
-// ─── semantic_index_model(model_name, embedding_csv) → VARCHAR ──────────
+// ─── dq_reports() → table ───────────────────────────────────────────────
 
-unsafe extern "C" fn semantic_index_model_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
+#[derive(Default)]
+struct ReportsState {
+    rows: Vec<(String, String, String, bool, String)>,
+    cursor: usize,
+}
 
-    if reader.row_count() == 0 || unsafe { !reader.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: no input") };
-        return;
-    }
-    let name = unsafe { reader.read_str(0).to_string() };
-    // param 2 is the embedding string (not directly readable with two params in a
-    // single VectorReader call — we need a second reader)
-    // For QuackRS scalars with 2 params, read both from the data chunk.
-    let reader2 = unsafe { VectorReader::new(input, 1) };
-    if unsafe { !reader2.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: missing embedding") };
-        return;
-    }
-    let embed_str = unsafe { reader2.read_str(0).to_string() };
-
-    match vectors::parse_vec(&embed_str) {
-        Ok(vec) => {
-            if let Ok(mut store) = vectors::get_vector_store().lock() {
-                store.index(&name, vec);
-                unsafe { writer.write_str(0, &format!("Indexed model '{}'", name)) };
-            } else {
-                unsafe { writer.write_str(0, "Error: lock failed") };
+fn dq_reports_bind(bind: &BindInfo) -> Result<ReportsState, ExtensionError> {
+    bind.add_result_column("name", TypeId::Varchar)
+        .add_result_column("table_name", TypeId::Varchar)
+        .add_result_column("summary", TypeId::Varchar)
+        .add_result_column("passed", TypeId::Boolean)
+        .add_result_column("run_at", TypeId::Varchar);
+    let mut rows = Vec::new();
+    match run_query_rows("SELECT name, table_name, summary, passed, run_at::VARCHAR FROM dq_reports ORDER BY run_at DESC") {
+        Ok(out) => {
+            for row in out {
+                let get = |i: usize| row.get(i).cloned().unwrap_or_default();
+                rows.push((get(0), get(1), get(2), get(3).eq_ignore_ascii_case("true"), get(4)));
             }
         }
         Err(e) => {
-            unsafe { writer.write_str(0, &format!("Error: {}", e)) };
+            rows.push((format!("ERROR: {}", e), String::new(), String::new(), false, String::new()));
         }
     }
+    Ok(ReportsState { rows, cursor: 0 })
 }
 
-// ─── semantic_vector_search(query_csv, k) → table ───────────────────────
-
-#[derive(Default)]
-struct VectorSearchState {
-    results: Vec<(String, f32)>,
-    cursor: usize,
-}
-
-// ─── semantic_graph_reset() → VARCHAR ───────────────────────────────────
-
-unsafe extern "C" fn semantic_graph_reset_fn(
-    _info: duckdb_function_info,
-    _input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    if let Ok(mut g) = graph::get_graph().lock() {
-        g.reset();
+fn reports_scan(state: &mut ReportsState, chunk: &DataChunk) -> Result<(), ExtensionError> {
+    if state.cursor >= state.rows.len() {
+        unsafe { chunk.set_size(0) };
+        return Ok(());
     }
-    unsafe { VectorWriter::new(output).write_str(0, "Graph cleared"); }
-}
-
-// ─── semantic_graph_add_edge(from, to, condition) → VARCHAR ─────────────
-
-unsafe extern "C" fn semantic_graph_add_edge_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let reader2 = unsafe { VectorReader::new(input, 1) };
-    let reader3 = unsafe { VectorReader::new(input, 2) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    if reader.row_count() == 0 || unsafe { !reader.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: missing from") };
-        return;
+    let (n, t, s, p, at) = &state.rows[state.cursor];
+    unsafe {
+        chunk.writer(0).write_str(0, n);
+        chunk.writer(1).write_str(0, t);
+        chunk.writer(2).write_str(0, s);
+        chunk.writer(3).write_bool(0, *p);
+        chunk.writer(4).write_str(0, at);
+        chunk.set_size(1);
     }
-    let from = unsafe { reader.read_str(0).to_string() };
-    let to = unsafe { reader2.read_str(0).to_string() };
-    let cond = unsafe { reader3.read_str(0).to_string() };
-    if let Ok(mut g) = graph::get_graph().lock() {
-        g.add_edge(&from, &to, &cond);
-        unsafe { writer.write_str(0, &format!("{} → {}", from, to)) };
-    }
+    state.cursor += 1;
+    Ok(())
 }
 
-// ─── semantic_discover_relationships(model_name) → table ────────────────
-
-#[derive(Default)]
-struct DiscoverState {
-    rows: Vec<(String, i32, String)>,  // (model_name, distance, join_condition)
-    cursor: usize,
-}
-
-// ─── semantic_shortest_path(from, to) → table ───────────────────────────
-
-#[derive(Default)]
-struct PathState {
-    steps: Vec<(String, String)>,  // (edge_label, join_condition)
-    cursor: usize,
-}
-
-// ─── semantic_query + semantic_models state ─────────────────────────────
-
-struct QueryState {
-    expanded_sql: String,
-    done: bool,
-}
-
-struct ModelsState {
-    models: Vec<(
-        String, String, String, String, i64,
-    )>,
-    cursor: usize,
-}
-
-// ─── Ontology: semantic_class_define(name, parent) → VARCHAR ───────────
-
-unsafe extern "C" fn semantic_class_define_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let reader2 = unsafe { VectorReader::new(input, 1) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    if reader.row_count() == 0 || unsafe { !reader.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: missing name") };
-        return;
-    }
-    let name = unsafe { reader.read_str(0).to_string() };
-    let parent = unsafe { reader2.read_str(0).to_string() };
-    let parent_opt = if parent.is_empty() { None } else { Some(parent.as_str()) };
-    if let Ok(mut o) = ontology::get_ontology().lock() {
-        o.define_class(&name, parent_opt, "");
-        unsafe { writer.write_str(0, &format!("Class '{}' defined", name)) };
-    }
-}
-
-// ─── Ontology: semantic_class_map(class, model, filter?) → VARCHAR ──────
-
-unsafe extern "C" fn semantic_class_map_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let reader2 = unsafe { VectorReader::new(input, 1) };
-    let reader3 = unsafe { VectorReader::new(input, 2) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    let class = unsafe { reader.read_str(0).to_string() };
-    let model = unsafe { reader2.read_str(0).to_string() };
-    let filter_str = unsafe { reader3.read_str(0).to_string() };
-    let filter = if filter_str.is_empty() { None } else { Some(filter_str.as_str()) };
-    if let Ok(mut o) = ontology::get_ontology().lock() {
-        o.map_class(&class, &model, filter);
-        unsafe { writer.write_str(0, &format!("{} → {}", class, model)) };
-    }
-}
-
-// ─── Ontology: semantic_property_define(name, domain, range, mapping?) → VARCHAR
-
-unsafe extern "C" fn semantic_property_define_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = unsafe { VectorReader::new(input, 0) };
-    let r1 = unsafe { VectorReader::new(input, 1) };
-    let r2 = unsafe { VectorReader::new(input, 2) };
-    let r3 = unsafe { VectorReader::new(input, 3) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    let name = unsafe { r0.read_str(0).to_string() };
-    let domain = unsafe { r1.read_str(0).to_string() };
-    let range = unsafe { r2.read_str(0).to_string() };
-    let map_str = unsafe { r3.read_str(0).to_string() };
-    let mapping = if map_str.is_empty() { None } else { Some(map_str.as_str()) };
-    if let Ok(mut o) = ontology::get_ontology().lock() {
-        o.define_property(&name, &domain, &range, mapping);
-        unsafe { writer.write_str(0, &format!("Property '{}' defined", name)) };
-    }
-}
-
-// ─── Ontology: semantic_ontology_export(format) → VARCHAR ───────────────
-
-unsafe extern "C" fn semantic_ontology_export_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    let fmt = if reader.row_count() > 0 && unsafe { reader.is_valid(0) } {
-        unsafe { reader.read_str(0).to_string() }
-    } else {
-        "ofn".to_string()
-    };
-    if let Ok(o) = ontology::get_ontology().lock() {
-        let text = match fmt.as_str() {
-            "ofn" => o.export_ofn(),
-            _ => format!("Unsupported format: {}. Use 'ofn'.", fmt),
-        };
-        unsafe { writer.write_str(0, &text) };
-    }
-}
-
-// ─── Ontology table states ──────────────────────────────────────────────
-
-#[derive(Default)]
-struct ClassQueryState {
-    sql: String,
-    done: bool,
-}
-
-#[derive(Default)]
-struct InheritanceState {
-    rows: Vec<(String, i32, String, String)>, // class, depth, kind, detail
-    cursor: usize,
-}
-
-// ─── Process Context: semantic_pattern_add(name, steps, domain, desc) → VARCHAR
-
-unsafe extern "C" fn semantic_pattern_add_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = unsafe { VectorReader::new(input, 0) };
-    let r1 = unsafe { VectorReader::new(input, 1) };
-    let r2 = unsafe { VectorReader::new(input, 2) };
-    let r3 = unsafe { VectorReader::new(input, 3) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    let name = unsafe { r0.read_str(0).to_string() };
-    let steps_json = unsafe { r1.read_str(0).to_string() };
-    let domain = unsafe { r2.read_str(0).to_string() };
-    let desc = unsafe { r3.read_str(0).to_string() };
-
-    // Parse steps: "customers,orders,order_items" or JSON array
-    let step_names: Vec<String> = if steps_json.starts_with('[') {
-        serde_json::from_str::<Vec<String>>(&steps_json).unwrap_or_default()
-    } else {
-        steps_json.split(',').map(|s| s.trim().to_string()).collect()
-    };
-
-    let steps: Vec<process::PatternStep> = step_names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| process::PatternStep {
-            model_name: n.clone(),
-            order: i as i32,
-            notes: String::new(),
-        })
-        .collect();
-
-    let pattern = process::WorkflowPattern {
-        name, description: desc, domain,
-        steps, frequency: 1,
-        source: "manual".into(),
-    };
-
-    if let Ok(mut store) = process::get_store().lock() {
-        store.add_pattern(pattern);
-        unsafe { writer.write_str(0, "Pattern added") };
-    }
-}
-
-// ─── Process Context: semantic_process_context(model_name) → table ──────
-
-#[derive(Default)]
-struct ProcessCtxState {
-    rows: Vec<(String, String, String)>, // (kind, key, value)
-    cursor: usize,
-}
-
-// ─── Process Context: semantic_pattern_search(query, k) → table ─────────
-
-#[derive(Default)]
-struct PatternSearchState {
-    rows: Vec<(String, String, String, String)>, // name, domain, steps, desc
-    cursor: usize,
-}
-
-// ─── Process Context: semantic_discover_patterns() → table ──────────────
-
-#[derive(Default)]
-struct DiscoverPatternsState {
-    rows: Vec<(String, i32, String)>, // path, frequency, type
-    cursor: usize,
-}
-
-// ─── Persistence: semantic_save(path) → VARCHAR ────────────────────────
-
-unsafe extern "C" fn semantic_save_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    if reader.row_count() == 0 { unsafe { writer.write_str(0, "Error: no path") }; return; }
-    let path = unsafe { reader.read_str(0).to_string() };
-    match persist::capture() {
-        Ok(snap) => {
-            match serde_json::to_string_pretty(&snap) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&path, &json) {
-                        unsafe { writer.write_str(0, &format!("Error: {}", e)) };
-                    } else {
-                        unsafe { writer.write_str(0, &format!("Saved to {}", path)) };
-                    }
-                }
-                Err(e) => unsafe { writer.write_str(0, &format!("Error: {}", e)) },
-            }
-        }
-        Err(e) => unsafe { writer.write_str(0, &format!("Error: {}", e)) },
-    }
-}
-
-// ─── Persistence: semantic_restore(path) → VARCHAR ──────────────────────
-
-unsafe extern "C" fn semantic_restore_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    if reader.row_count() == 0 { unsafe { writer.write_str(0, "Error: no path") }; return; }
-    let path = unsafe { reader.read_str(0).to_string() };
-    match std::fs::read_to_string(&path) {
-        Ok(json) => {
-            match serde_json::from_str::<persist::Snapshot>(&json) {
-                Ok(snap) => match persist::restore(&snap) {
-                    Ok(msg) => unsafe { writer.write_str(0, &msg) },
-                    Err(e) => unsafe { writer.write_str(0, &format!("Error: {}", e)) },
-                },
-                Err(e) => unsafe { writer.write_str(0, &format!("Error: {}", e)) },
-            }
-        }
-        Err(e) => unsafe { writer.write_str(0, &format!("Error: {}", e)) },
-    }
-}
-
-// ─── BM25 scalars ──────────────────────────────────────────────────────
-
-unsafe extern "C" fn semantic_bm25_index_doc_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = unsafe { VectorReader::new(input, 0) };
-    let r1 = unsafe { VectorReader::new(input, 1) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    if r0.row_count() == 0 || unsafe { !r0.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: missing doc_id") };
-        return;
-    }
-    let doc_id = unsafe { r0.read_str(0).to_string() };
-    let text = unsafe { r1.read_str(0).to_string() };
-    if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
-        bm.index_doc(&doc_id, &text);
-        unsafe { writer.write_str(0, &format!("Indexed '{}' ({} docs total)", doc_id, bm.len())) };
-    }
-}
-
-unsafe extern "C" fn semantic_bm25_remove_doc_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    if reader.row_count() == 0 || unsafe { !reader.is_valid(0) } {
-        unsafe { writer.write_str(0, "Error: missing doc_id") };
-        return;
-    }
-    let doc_id = unsafe { reader.read_str(0).to_string() };
-    if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
-        bm.remove_doc(&doc_id);
-        unsafe { writer.write_str(0, &format!("Removed '{}' ({} docs remain)", doc_id, bm.len())) };
-    }
-}
-
-unsafe extern "C" fn semantic_bm25_reset_fn(
-    _info: duckdb_function_info,
-    _input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
-        bm.reset();
-    }
-    unsafe { VectorWriter::new(output).write_str(0, "BM25 index cleared"); }
-}
-
-unsafe extern "C" fn semantic_bm25_stemmer_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let reader = unsafe { VectorReader::new(input, 0) };
-    let mut writer = unsafe { VectorWriter::new(output) };
-    let lang = if reader.row_count() > 0 && unsafe { reader.is_valid(0) } {
-        unsafe { reader.read_str(0).to_string() }
-    } else {
-        "english".to_string()
-    };
-    let algorithm = match lang.as_str() {
-        "arabic" => rust_stemmers::Algorithm::Arabic,
-        "danish" => rust_stemmers::Algorithm::Danish,
-        "dutch" => rust_stemmers::Algorithm::Dutch,
-        "english" => rust_stemmers::Algorithm::English,
-        "french" => rust_stemmers::Algorithm::French,
-        "german" => rust_stemmers::Algorithm::German,
-        "greek" => rust_stemmers::Algorithm::Greek,
-        "hungarian" => rust_stemmers::Algorithm::Hungarian,
-        "italian" => rust_stemmers::Algorithm::Italian,
-        "norwegian" => rust_stemmers::Algorithm::Norwegian,
-        "portuguese" => rust_stemmers::Algorithm::Portuguese,
-        "romanian" => rust_stemmers::Algorithm::Romanian,
-        "russian" => rust_stemmers::Algorithm::Russian,
-        "spanish" => rust_stemmers::Algorithm::Spanish,
-        "swedish" => rust_stemmers::Algorithm::Swedish,
-        "tamil" => rust_stemmers::Algorithm::Tamil,
-        "turkish" => rust_stemmers::Algorithm::Turkish,
-        "none" => {
-            if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
-                bm.clear_stemmer();
-            }
-            unsafe { writer.write_str(0, "Stemmer disabled"); }
-            return;
-        }
-        _ => {
-            unsafe { writer.write_str(0, &format!("Unknown language: {}. Use 'none' to disable.", lang)) };
-            return;
-        }
-    };
-    if let Ok(mut bm) = crate::bm25::get_bm25().lock() {
-        bm.set_stemmer(rust_stemmers::Stemmer::create(algorithm));
-        unsafe { writer.write_str(0, &format!("Stemmer set to {}", lang)); }
-    }
-}
-
-// ─── BM25 search state ──────────────────────────────────────────────────
-
-#[derive(Default)]
-struct Bm25SearchState {
-    results: Vec<(String, f32)>,
-    cursor: usize,
-}
-
-// ─── Hybrid fusion state ────────────────────────────────────────────────
-
-#[derive(Default)]
-struct HybridState {
-    results: Vec<(String, f32, f32, f32, f32)>, // name, dense, bm25, graph, fused
-    cursor: usize,
-}
-
-// ─── DDL scalar functions ────────────────────────────────────────────────
-
-unsafe extern "C" fn semantic_create_view_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = unsafe { VectorReader::new(input, 0) };
-    let mut w = unsafe { VectorWriter::new(output) };
-    if r0.row_count() == 0 || unsafe { !r0.is_valid(0) } {
-        unsafe { w.write_str(0, "Error: no input") };
-        return;
-    }
-    let ddl_text = unsafe { r0.read_str(0).to_string() };
-    match ddl::parse_ddl(&ddl_text) {
-        Ok(view) => {
-            let name = view.name.clone();
-            if let Ok(mut views) = ddl::get_views().lock() {
-                views.insert(name.clone(), view);
-                unsafe { w.write_str(0, &format!("Created semantic view '{}'", name)) };
-            }
-        }
-        Err(e) => unsafe { w.write_str(0, &format!("Error: {}", e)) },
-    }
-}
-
-unsafe extern "C" fn semantic_view_expand_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = unsafe { VectorReader::new(input, 0) };
-    let r1 = unsafe { VectorReader::new(input, 1) };
-    let r2 = unsafe { VectorReader::new(input, 2) };
-    let mut w = unsafe { VectorWriter::new(output) };
-    let view_name = unsafe { r0.read_str(0).to_string() };
-    let dims_str = unsafe { r1.read_str(0).to_string() };
-    let mets_str = unsafe { r2.read_str(0).to_string() };
-    let dims: Vec<String> = dims_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    let mets: Vec<String> = mets_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    match ddl::expand_view(&view_name, &dims, &mets) {
-        Ok(sql) => unsafe { w.write_str(0, &sql) },
-        Err(e) => unsafe { w.write_str(0, &format!("Error: {}", e)) },
-    }
-}
-
-// ─── Extension registration ─────────────────────────────────────────────
+// ─── Registration ───────────────────────────────────────────────────────
 
 fn register(con: &Connection) -> Result<(), ExtensionError> {
     let raw_con = con.as_raw_connection();
 
-    // ── Core scalars ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_load")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_load_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_dry_plan")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_dry_plan_fn).register(raw_con)?;
-    }
+    // Persistent secondary connection for query execution
+    engine::init_early(con);
 
-    // ── L1: Vector scalars ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_index_model")
-            .param(TypeId::Varchar).param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_index_model_fn).register(raw_con)?;
-    }
-
-    // ── L1: Vector search table ──
-    let vs_tf = TableFunctionBuilder::new("semantic_vector_search")
-        .param(TypeId::Varchar).param(TypeId::Integer)
-        .with_state::<VectorSearchState, _>(|bind| {
-            bind.add_result_column("model_name", TypeId::Varchar);
-            bind.add_result_column("score", TypeId::Float);
-
-            if bind.parameter_count() >= 2 {
-                let query_str = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let k_val = unsafe { bind.get_parameter_value(1) };
-                let k: usize = k_val.as_i64_or(5) as usize;
-
-                match vectors::parse_vec(&query_str) {
-                    Ok(qvec) => {
-                        let store = vectors::get_vector_store().lock().map_err(|_e| "lock")?;
-                        Ok(VectorSearchState { results: store.search(&qvec, k), cursor: 0 })
-                    }
-                    Err(_e) => {
-                        Ok(VectorSearchState { results: vec![], cursor: 0 })
-                    }
-                }
-            } else {
-                Ok(VectorSearchState::default())
-            }
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.results.len() {
-                unsafe { chunk.set_size(0) };
-                return Ok(());
-            }
-            let (name, score) = &state.results[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, name);
-                chunk.writer(1).write_f32(0, *score);
-                chunk.set_size(1);
-            }
-            state.cursor += 1;
-            Ok(())
-        })
-        .build()?;
-    unsafe { let _ = con.register_table(vs_tf); }
-
-    // ── L2: Graph scalars ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_graph_reset")
-            .returns(TypeId::Varchar)
-            .function(semantic_graph_reset_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_graph_add_edge")
-            .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
-            .returns(TypeId::Varchar)
-            .function(semantic_graph_add_edge_fn).register(raw_con)?;
-    }
-
-    // ── L2: discover_relationships table ──
-    let disc_tf = TableFunctionBuilder::new("semantic_discover_relationships")
-        .param(TypeId::Varchar)
-        .with_state::<DiscoverState, _>(|bind| {
-            bind.add_result_column("target_model", TypeId::Varchar);
-            bind.add_result_column("distance", TypeId::Integer);
-            bind.add_result_column("join_condition", TypeId::Varchar);
-
-            if bind.parameter_count() >= 1 {
-                let model = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let g = graph::get_graph().lock().map_err(|e| e.to_string())?;
-                let rows = g.discover(&model);
-                Ok(DiscoverState { rows, cursor: 0 })
-            } else {
-                Ok(DiscoverState::default())
-            }
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.rows.len() {
-                unsafe { chunk.set_size(0) };
-                return Ok(());
-            }
-            let (name, dist, cond) = &state.rows[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, name);
-                chunk.writer(1).write_i64(0, *dist as i64);
-                chunk.writer(2).write_str(0, cond);
-                chunk.set_size(1);
-            }
-            state.cursor += 1;
-            Ok(())
-        })
-        .build()?;
-    unsafe { let _ = con.register_table(disc_tf); }
-
-    // ── L2: shortest_path table ──
-    let path_tf = TableFunctionBuilder::new("semantic_shortest_path")
+    // expect_not_null(table, col)
+    let tf = TableFunctionBuilder::new("expect_not_null")
         .param(TypeId::Varchar).param(TypeId::Varchar)
-        .with_state::<PathState, _>(|bind| {
-            bind.add_result_column("edge", TypeId::Varchar);
-            bind.add_result_column("join_condition", TypeId::Varchar);
-
-            if bind.parameter_count() >= 2 {
-                let from = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let to = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default();
-                let g = graph::get_graph().lock().map_err(|e| e.to_string())?;
-                let steps = g.shortest_path(&from, &to);
-                Ok(PathState { steps, cursor: 0 })
-            } else {
-                Ok(PathState::default())
-            }
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            expect_not_null_bind(bind, &table, &column)
         })
-        .scan(|state, chunk| {
-            if state.cursor >= state.steps.len() {
-                unsafe { chunk.set_size(0) };
-                return Ok(());
-            }
-            let (edge, cond) = &state.steps[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, edge);
-                chunk.writer(1).write_str(0, cond);
-                chunk.set_size(1);
-            }
-            state.cursor += 1;
-            Ok(())
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // expect_unique(table, col)
+    let tf = TableFunctionBuilder::new("expect_unique")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            expect_unique_bind(bind, &table, &column)
         })
-        .build()?;
-    unsafe { let _ = con.register_table(path_tf); }
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
 
-    // ── L3: Ontology scalars ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_class_define")
-            .param(TypeId::Varchar).param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_class_define_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_class_map")
-            .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_class_map_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_property_define")
-            .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
-            .returns(TypeId::Varchar)
-            .function(semantic_property_define_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_ontology_export")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_ontology_export_fn).register(raw_con)?;
-    }
+    // expect_in_range(table, col, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_in_range")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .param(TypeId::Double).param(TypeId::Double)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let column = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let lo = unsafe { bind.get_parameter_value(2) }.as_f64_or(f64::MIN);
+            let hi = unsafe { bind.get_parameter_value(3) }.as_f64_or(f64::MAX);
+            expect_in_range_bind(bind, &table, &column, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
 
-    // ── L3: semantic_class_query(class_name) → table ──
-    let cq_tf = TableFunctionBuilder::new("semantic_class_query")
+    // expect_row_count_between(table, lo, hi)
+    let tf = TableFunctionBuilder::new("expect_row_count_between")
+        .param(TypeId::Varchar).param(TypeId::BigInt).param(TypeId::BigInt)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let lo = unsafe { bind.get_parameter_value(1) }.as_i64_or(0);
+            let hi = unsafe { bind.get_parameter_value(2) }.as_i64_or(i64::MAX);
+            expect_row_count_between_bind(bind, &table, lo, hi)
+        })
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // profile_table(table)
+    let tf = TableFunctionBuilder::new("profile_table")
         .param(TypeId::Varchar)
-        .with_state::<ClassQueryState, _>(|bind| {
-            bind.add_result_column("expanded_sql", TypeId::Varchar);
-            if bind.parameter_count() >= 1 {
-                let class = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let o = ontology::get_ontology().lock().map_err(|_e| "lock")?;
-                match o.class_query_sql(&class) {
-                    Ok(sql) => Ok(ClassQueryState { sql, done: false }),
-                    Err(e) => Ok(ClassQueryState { sql: format!("Error: {}", e), done: false }),
-                }
-            } else {
-                Ok(ClassQueryState::default())
-            }
+        .with_state::<ProfileState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            profile_table_bind(bind, &table)
         })
-        .scan(|state, chunk| {
-            if state.done { unsafe { chunk.set_size(0) }; return Ok(()); }
-            unsafe { chunk.writer(0).write_str(0, &state.sql); chunk.set_size(1); }
-            state.done = true;
-            Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(cq_tf); }
+        .scan(profile_scan).build()?;
+    unsafe { let _ = con.register_table(tf); }
 
-    // ── L3: semantic_class_inheritance(class_name) → table ──
-    let inh_tf = TableFunctionBuilder::new("semantic_class_inheritance")
-        .param(TypeId::Varchar)
-        .with_state::<InheritanceState, _>(|bind| {
-            bind.add_result_column("class", TypeId::Varchar);
-            bind.add_result_column("depth", TypeId::Integer);
-            bind.add_result_column("kind", TypeId::Varchar);
-            bind.add_result_column("detail", TypeId::Varchar);
-            if bind.parameter_count() >= 1 {
-                let class = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let o = ontology::get_ontology().lock().map_err(|_e| "lock")?;
-                let mut rows = Vec::new();
-                // Self
-                rows.push((class.clone(), 0, "self".into(), "—".into()));
-                // Ancestors
-                for (depth, a) in o.ancestors(&class).iter().enumerate() {
-                    rows.push((a.clone(), (depth + 1) as i32, "is-a".into(), format!("← {}", class)));
-                }
-                // Descendants
-                for d in o.descendants(&class) {
-                    rows.push((d, -1, "subclass".into(), format!("{} →", class)));
-                }
-                // Inherited properties
-                for p in o.inherited_properties(&class) {
-                    rows.push((p.name, 0, "property".into(), format!("{} → {}", p.domain, p.range)));
-                }
-                // Inherited mapping
-                if let Some(m) = o.inherited_mapping(&class) {
-                    let filter = m.filter.unwrap_or_default();
-                    rows.push((m.class_name, 0, "mapping".into(), format!("→ {} WHERE {}", m.model_name, filter)));
-                }
-                Ok(InheritanceState { rows, cursor: 0 })
-            } else {
-                Ok(InheritanceState::default())
-            }
+    // validate_expectations(table, json)
+    let tf = TableFunctionBuilder::new("validate_expectations")
+        .param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<AssertionState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let rules = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            validate_expectations_bind(bind, &table, &rules)
         })
-        .scan(|state, chunk| {
-            if state.cursor >= state.rows.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (cls, dep, kind, det) = &state.rows[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, cls); chunk.writer(1).write_i64(0, *dep as i64);
-                chunk.writer(2).write_str(0, kind); chunk.writer(3).write_str(0, det);
-                chunk.set_size(1);
-            }
-            state.cursor += 1;
-            Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(inh_tf); }
+        .scan(write_assertion).build()?;
+    unsafe { let _ = con.register_table(tf); }
 
-    // ── L4: Process Context scalars ──
+    // dq_run(name, table, json) → scalar
     unsafe {
-        ScalarFunctionBuilder::new("semantic_pattern_add")
-            .param(TypeId::Varchar).param(TypeId::Varchar)
-            .param(TypeId::Varchar).param(TypeId::Varchar)
-            .returns(TypeId::Varchar)
-            .function(semantic_pattern_add_fn).register(raw_con)?;
-    }
-
-    // ── L4: semantic_process_context(model_name) → table ──
-    let pc_tf = TableFunctionBuilder::new("semantic_process_context")
-        .param(TypeId::Varchar)
-        .with_state::<ProcessCtxState, _>(|bind| {
-            bind.add_result_column("kind", TypeId::Varchar);
-            bind.add_result_column("key", TypeId::Varchar);
-            bind.add_result_column("value", TypeId::Varchar);
-            if bind.parameter_count() >= 1 {
-                let model = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let store = process::get_store().lock().map_err(|_e| "lock")?;
-                let mut rows = Vec::new();
-
-                // Hub detection: check graph connectivity
-                if let Ok(g) = graph::get_graph().lock() {
-                    let related = g.discover(&model);
-                    let degree = related.len();
-                    let is_hub = degree >= 3;
-                    rows.push(("hub".into(), model.clone(), format!("degree={}, is_hub={}", degree, is_hub)));
-                }
-
-                // Pattern matches
-                for p in store.patterns_for(&model) {
-                    let steps = p.node_ids().join(" → ");
-                    rows.push(("pattern".into(), p.name.clone(), steps));
-                    // Co-occurring models
-                    for s in &p.steps {
-                        if s.model_name != model {
-                            rows.push(("co_occurring".into(), model.clone(), s.model_name.clone()));
-                        }
-                    }
-                }
-
-                if rows.is_empty() {
-                    rows.push(("info".into(), "no_context".into(), "No patterns or graph edges found".into()));
-                }
-                Ok(ProcessCtxState { rows, cursor: 0 })
-            } else {
-                Ok(ProcessCtxState::default())
-            }
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.rows.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (k, key, val) = &state.rows[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, k); chunk.writer(1).write_str(0, key);
-                chunk.writer(2).write_str(0, val); chunk.set_size(1);
-            }
-            state.cursor += 1; Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(pc_tf); }
-
-    // ── L4: semantic_pattern_search(query, k) → table ──
-    let ps_tf = TableFunctionBuilder::new("semantic_pattern_search")
-        .param(TypeId::Varchar).param(TypeId::Integer)
-        .with_state::<PatternSearchState, _>(|bind| {
-            bind.add_result_column("name", TypeId::Varchar);
-            bind.add_result_column("domain", TypeId::Varchar);
-            bind.add_result_column("steps", TypeId::Varchar);
-            bind.add_result_column("description", TypeId::Varchar);
-            if bind.parameter_count() >= 2 {
-                let query = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let k_val = unsafe { bind.get_parameter_value(1) };
-                let k = k_val.as_i64_or(5) as usize;
-                let store = process::get_store().lock().map_err(|_e| "lock")?;
-                let matches = store.search(&query, k);
-                let rows: Vec<_> = matches.iter().map(|p| {
-                    (p.name.clone(), p.domain.clone(), p.node_ids().join(","), p.description.clone())
-                }).collect();
-                Ok(PatternSearchState { rows, cursor: 0 })
-            } else {
-                Ok(PatternSearchState::default())
-            }
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.rows.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (n, d, s, desc) = &state.rows[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, n); chunk.writer(1).write_str(0, d);
-                chunk.writer(2).write_str(0, s); chunk.writer(3).write_str(0, desc);
-                chunk.set_size(1);
-            }
-            state.cursor += 1; Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(ps_tf); }
-
-    // ── L4: semantic_discover_patterns() → table ──
-    let dp_tf = TableFunctionBuilder::new("semantic_discover_patterns")
-        .with_state::<DiscoverPatternsState, _>(|bind| {
-            bind.add_result_column("path", TypeId::Varchar);
-            bind.add_result_column("frequency", TypeId::Integer);
-            bind.add_result_column("type", TypeId::Varchar);
-            let mut rows = Vec::new();
-            // Mine paths from FK graph
-            if let Ok(g) = graph::get_graph().lock() {
-                // Build edge list from graph concepts
-                let edges: Vec<(String, String)> = g.edges().into_iter().map(|(a, b, _)| (a, b)).collect();
-                let paths = process::PatternDiscovery::frequent_paths(&edges, &g, 3, 10);
-                for (path, freq) in paths {
-                    rows.push((path.join(" → "), freq, "frequent-path".into()));
-                }
-            }
-            Ok(DiscoverPatternsState { rows, cursor: 0 })
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.rows.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (p, f, t) = &state.rows[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, p); chunk.writer(1).write_i64(0, *f as i64);
-                chunk.writer(2).write_str(0, t); chunk.set_size(1);
-            }
-            state.cursor += 1; Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(dp_tf); }
-
-    // ── P0: Persistence scalars ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_save")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_save_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_restore")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_restore_fn).register(raw_con)?;
-    }
-
-    // ── BM25 scalars ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_bm25_index_doc")
-            .param(TypeId::Varchar).param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_bm25_index_doc_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_bm25_remove_doc")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_bm25_remove_doc_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_bm25_reset")
-            .returns(TypeId::Varchar)
-            .function(semantic_bm25_reset_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_bm25_stemmer")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_bm25_stemmer_fn).register(raw_con)?;
-    }
-
-    // ── BM25: semantic_bm25_search(query, k) → table ──
-    let bm_tf = TableFunctionBuilder::new("semantic_bm25_search")
-        .param(TypeId::Varchar).param(TypeId::Integer)
-        .with_state::<Bm25SearchState, _>(|bind| {
-            bind.add_result_column("doc_id", TypeId::Varchar);
-            bind.add_result_column("bm25_score", TypeId::Float);
-            if bind.parameter_count() >= 2 {
-                let query = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let k_val = unsafe { bind.get_parameter_value(1) };
-                let k = k_val.as_i64_or(5) as usize;
-                let bm = crate::bm25::get_bm25().lock().map_err(|_e| "lock")?;
-                Ok(Bm25SearchState { results: bm.search(&query, k), cursor: 0 })
-            } else {
-                Ok(Bm25SearchState::default())
-            }
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.results.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (id, score) = &state.results[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, id);
-                chunk.writer(1).write_f32(0, *score);
-                chunk.set_size(1);
-            }
-            state.cursor += 1; Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(bm_tf); }
-
-    // ── DDL: semantic_create_view + semantic_view_expand ──
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_create_view")
-            .param(TypeId::Varchar).returns(TypeId::Varchar)
-            .function(semantic_create_view_fn).register(raw_con)?;
-    }
-    unsafe {
-        ScalarFunctionBuilder::new("semantic_view_expand")
+        ScalarFunctionBuilder::new("dq_run")
             .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
             .returns(TypeId::Varchar)
-            .function(semantic_view_expand_fn).register(raw_con)?;
+            .function(dq_run_fn).register(raw_con)?;
     }
 
-    // ── P0: semantic_hybrid_search(query_vec, k, dw?, gw?, bq?, bw?, hub?) → table ──
-    let hy_tf = TableFunctionBuilder::new("semantic_hybrid_search")
-        .param(TypeId::Varchar).param(TypeId::Integer)
-        .param(TypeId::Float).param(TypeId::Float)
-        .param(TypeId::Varchar).param(TypeId::Float)
-        .param(TypeId::Varchar)
-        .with_state::<HybridState, _>(|bind| {
-            bind.add_result_column("model_name", TypeId::Varchar);
-            bind.add_result_column("dense_score", TypeId::Float);
-            bind.add_result_column("bm25_score", TypeId::Float);
-            bind.add_result_column("graph_score", TypeId::Float);
-            bind.add_result_column("fused_score", TypeId::Float);
-            if bind.parameter_count() >= 2 {
-                let qv = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                let k_val = unsafe { bind.get_parameter_value(1) };
-                let k = k_val.as_i64_or(5) as usize;
-                let dw = if bind.parameter_count() >= 3 {
-                    unsafe { bind.get_parameter_value(2) }.as_f64_or(0.50) as f32
-                } else { 0.50 };
-                let gw = if bind.parameter_count() >= 4 {
-                    unsafe { bind.get_parameter_value(3) }.as_f64_or(0.20) as f32
-                } else { 0.20 };
-                let bq = if bind.parameter_count() >= 5 {
-                    let s = unsafe { bind.get_parameter_value(4) }.as_str().unwrap_or_default();
-                    if s.is_empty() { None } else { Some(s) }
-                } else { None };
-                let bw = if bind.parameter_count() >= 6 {
-                    unsafe { bind.get_parameter_value(5) }.as_f64_or(0.30) as f32
-                } else { 0.30 };
-                let hub = if bind.parameter_count() >= 7 {
-                    let s = unsafe { bind.get_parameter_value(6) }.as_str().unwrap_or_default();
-                    if s.is_empty() { None } else { Some(s) }
-                } else { None };
-                match vectors::parse_vec(&qv) {
-                    Ok(qvec) => {
-                        let results: Vec<_> = fusion::hybrid_search(
-                            &qvec, k, dw, bw, gw, bq.as_deref(), hub.as_deref(),
-                        )
-                        .into_iter()
-                        .map(|r| (r.model_name, r.dense_score, r.bm25_score, r.graph_score, r.fused_score))
-                        .collect();
-                        Ok(HybridState { results, cursor: 0 })
-                    }
-                    Err(_) => Ok(HybridState::default()),
-                }
-            } else { Ok(HybridState::default()) }
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.results.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (n, ds, bs, gs, fs) = &state.results[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, n); chunk.writer(1).write_f32(0, *ds);
-                chunk.writer(2).write_f32(0, *bs); chunk.writer(3).write_f32(0, *gs);
-                chunk.writer(4).write_f32(0, *fs);
-                chunk.set_size(1);
-            }
-            state.cursor += 1; Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(hy_tf); }
-
-    // ── Core tables: semantic_query + semantic_models ──
-    let query_tf = TableFunctionBuilder::new("semantic_query")
-        .param(TypeId::Varchar)
-        .with_state::<QueryState, _>(|bind| {
-            bind.add_result_column("expanded_sql", TypeId::Varchar);
-            if bind.parameter_count() >= 1 {
-                let sql_text = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default();
-                if let Ok(guard) = get_ctx().lock() {
-                    if let Some(ctx) = guard.as_ref() {
-                        match planner::expand_sql(&sql_text, ctx) {
-                            Ok(e) => return Ok(QueryState { expanded_sql: e, done: false }),
-                            Err(e) => return Ok(QueryState { expanded_sql: format!("Error: {}", e), done: false }),
-                        }
-                    }
-                }
-            }
-            Ok(QueryState { expanded_sql: "Error: No MDL loaded".into(), done: false })
-        })
-        .scan(|state, chunk| {
-            if state.done { unsafe { chunk.set_size(0) }; return Ok(()); }
-            unsafe { chunk.writer(0).write_str(0, &state.expanded_sql); chunk.set_size(1); }
-            state.done = true;
-            Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(query_tf); }
-
-    let models_tf = TableFunctionBuilder::new("semantic_models")
-        .with_state::<ModelsState, _>(|bind| {
-            bind.add_result_column("name", TypeId::Varchar);
-            bind.add_result_column("catalog", TypeId::Varchar);
-            bind.add_result_column("schema_name", TypeId::Varchar);
-            bind.add_result_column("table_name", TypeId::Varchar);
-            bind.add_result_column("column_count", TypeId::Integer);
-            let models = get_ctx().lock().ok().and_then(|g| g.clone()).map(|ctx| {
-                ctx.models.iter().map(|m| {
-                    let (cat, sch, tbl) = m.table_reference.as_ref().map(|tr| {
-                        (tr.catalog.clone().unwrap_or_default(), tr.schema.clone().unwrap_or_default(), tr.table.clone())
-                    }).unwrap_or_default();
-                    (m.name.clone(), cat, sch, tbl, m.columns.len() as i64)
-                }).collect()
-            }).unwrap_or_default();
-            Ok(ModelsState { models, cursor: 0 })
-        })
-        .scan(|state, chunk| {
-            if state.cursor >= state.models.len() { unsafe { chunk.set_size(0) }; return Ok(()); }
-            let (n, c, s, t, cc) = &state.models[state.cursor];
-            unsafe {
-                chunk.writer(0).write_str(0, n); chunk.writer(1).write_str(0, c);
-                chunk.writer(2).write_str(0, s); chunk.writer(3).write_str(0, t);
-                chunk.writer(4).write_i64(0, *cc); chunk.set_size(1);
-            }
-            state.cursor += 1;
-            Ok(())
-        }).build()?;
-    unsafe { let _ = con.register_table(models_tf); }
+    // dq_reports() → table
+    let tf = TableFunctionBuilder::new("dq_reports")
+        .with_state::<ReportsState, _>(|bind| dq_reports_bind(bind))
+        .scan(reports_scan).build()?;
+    unsafe { let _ = con.register_table(tf); }
 
     Ok(())
 }
 
-entry_point_v2!(semantic_init_c_api, |con| register(con));
+entry_point_v2!(dq_init_c_api, |con| register(con));

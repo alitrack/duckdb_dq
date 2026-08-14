@@ -2,7 +2,7 @@
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-EXTENSION_NAME=semantic
+EXTENSION_NAME=dq
 
 USE_UNSTABLE_C_API=0
 TARGET_DUCKDB_VERSION=v1.2.0
