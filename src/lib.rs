@@ -1152,6 +1152,115 @@ fn write_dashboard(state: &mut DashboardState, chunk: &DataChunk) -> Result<(), 
     Ok(())
 }
 
+// ─── dq_federated(sources_json, table, rules_json) → table ─────────────
+// Cross-DB quality baselines. sources_json is a JSON array of source names,
+// e.g. ["pg_prod", "mysql_prod"]. Each name must be an existing
+// duckdb_universal named connection (universal_connect). For every source a
+// temp view over universal_foreign_table is created, the full rule set runs
+// against it, and per-source results are emitted:
+//   source | rule | column | passed | row_count | failed_count | error
+
+#[derive(Default)]
+struct FederatedState {
+    rows: Vec<(String, String, String, bool, i64, i64, String)>,
+    cursor: usize,
+}
+
+fn dq_federated_bind(
+    bind: &BindInfo,
+    sources_json: &str,
+    table: &str,
+    rules_json: &str,
+) -> Result<FederatedState, ExtensionError> {
+    bind.add_result_column("source", TypeId::Varchar)
+        .add_result_column("rule", TypeId::Varchar)
+        .add_result_column("column", TypeId::Varchar)
+        .add_result_column("passed", TypeId::Boolean)
+        .add_result_column("row_count", TypeId::BigInt)
+        .add_result_column("failed_count", TypeId::BigInt)
+        .add_result_column("error", TypeId::Varchar);
+
+    let sources: Vec<String> = match serde_json::from_str::<serde_json::Value>(sources_json) {
+        Ok(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => {
+            // Fall back to a single comma-separated name for convenience.
+            sources_json
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+    };
+
+    let mut rows = Vec::new();
+    for src in &sources {
+        // Bridge: CREATE VIEW (main catalog — visible to the persistent
+        // connection) over the remote table.
+        let view_name = format!("dq_fed_{}", sanitize(src));
+        let view_sql = format!(
+            "CREATE OR REPLACE VIEW {} AS SELECT * FROM universal_foreign_table('{}', '{}')",
+            view_name,
+            src.replace('\'', "''"),
+            table.replace('\'', "''")
+        );
+        if let Err(e) = engine::run_exec(&view_sql) {
+            rows.push((
+                src.clone(),
+                "connect".into(),
+                String::new(),
+                false,
+                0,
+                0,
+                format!("view over {} failed: {}", table, e),
+            ));
+            continue;
+        }
+        let results = validate::run_rules(&view_name, rules_json);
+        for r in results {
+            rows.push((
+                src.clone(),
+                r.rule,
+                r.column,
+                r.passed,
+                r.row_count,
+                r.failed_count,
+                r.error,
+            ));
+        }
+    }
+
+    Ok(FederatedState { rows, cursor: 0 })
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn write_federated(state: &mut FederatedState, chunk: &DataChunk) -> Result<(), ExtensionError> {
+    if state.cursor >= state.rows.len() {
+        unsafe { chunk.set_size(0) };
+        return Ok(());
+    }
+    let (source, rule, column, passed, row_count, failed_count, error) = &state.rows[state.cursor];
+    unsafe {
+        chunk.writer(0).write_str(0, source);
+        chunk.writer(1).write_str(0, rule);
+        chunk.writer(2).write_str(0, column);
+        chunk.writer(3).write_bool(0, *passed);
+        chunk.writer(4).write_i64(0, *row_count);
+        chunk.writer(5).write_i64(0, *failed_count);
+        chunk.writer(6).write_str(0, error);
+        chunk.set_size(1);
+    }
+    state.cursor += 1;
+    Ok(())
+}
+
 // ─── dq_reports() → table ───────────────────────────────────────────────
 
 #[derive(Default)]
@@ -1547,6 +1656,18 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             dq_dashboard_bind(bind, &table, &rules)
         })
         .scan(write_dashboard).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // dq_federated(sources_json, table, json) → table
+    let tf = TableFunctionBuilder::new("dq_federated")
+        .param(TypeId::Varchar).param(TypeId::Varchar).param(TypeId::Varchar)
+        .with_state::<FederatedState, _>(move |bind| {
+            let sources = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            let table = unsafe { bind.get_parameter_value(1) }.as_str().unwrap_or_default().to_string();
+            let rules = unsafe { bind.get_parameter_value(2) }.as_str().unwrap_or_default().to_string();
+            dq_federated_bind(bind, &sources, &table, &rules)
+        })
+        .scan(write_federated).build()?;
     unsafe { let _ = con.register_table(tf); }
 
     Ok(())

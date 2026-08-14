@@ -223,3 +223,4 @@ FROM dq_dashboard('sales', '{
   "expect_column_values_unique": {"column": "id"},
   "expect_column_values_in_range": {"column": "amount", "min": 0, "max": 100000}
 }');  -- 4 checks; unique FAILS (7/8) + in_range FAILS (-10 < 0) → failed=2, pass_rate=0.5
+
