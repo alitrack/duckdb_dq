@@ -40,6 +40,7 @@ Data quality assertion framework for DuckDB — SQL-native `expect_*` rules, pro
 | `dq_reports()` | table | Persisted run history (name, table, summary, passed, run_at) |
 | `dq_dashboard(table, json_rules)` | table | dash-compatible dashboard JSON + checks/passed/failed/pass_rate |
 | `dq_federated(sources_json, table, json_rules)` | table | Cross-DB quality baseline via duckdb_universal (per-source results) |
+| `dq_suggest(table)` | table | Profile-driven candidate rules (rule, column, severity, reason, params) — recall-first: surfaces checks worth running instead of waiting for you to invent them; suggestions feed straight into `validate_expectations` |
 
 ## Quick start
 
@@ -78,6 +79,12 @@ SELECT dq_run('daily_sales', 'sales', '{
 
 -- Report history (time-series quality tracking)
 SELECT * FROM dq_reports();
+
+-- Profile-driven suggestions: what should I be checking? (recall-first)
+SELECT * FROM dq_suggest('sales');
+-- rule | column_name | severity | reason | params
+-- → high-severity NULL / duplication / near-constant signals, each with
+--   ready-to-run params you can feed into validate_expectations
 ```
 
 ## Design
@@ -121,6 +128,7 @@ Test locally:
 - [x] dq_run + dq_reports persistence
 - [x] dq_dashboard → duckdb_dashboard (dash_create-compatible JSON, verified end-to-end)
 - [x] dq_federated → duckdb_universal (cross-DB quality baselines, SQLite fixtures verified)
+- [x] dq_suggest → profile-driven candidate rules (recall-first: NULL / duplication / near-constant signals with severity + runnable params)
 - [ ] 30+ assertions (GX full parity: set membership of expected, match_like)
 
 ## License

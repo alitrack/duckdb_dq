@@ -953,6 +953,116 @@ fn profile_scan(state: &mut ProfileState, chunk: &DataChunk) -> Result<(), Exten
     Ok(())
 }
 
+// ─── dq_suggest(table) → candidate rules ───────────────────────────────
+// Profile-driven rule suggestions. "Recall-first": the system surfaces the
+// checks worth running instead of waiting for the user to invent them, and
+// stays an assistant — every suggestion carries a severity + reason, and the
+// user decides what to execute (can be fed straight into validate_expectations).
+
+#[derive(Default)]
+struct SuggestState {
+    rows: Vec<(String, String, String, String, String)>, // rule, column, severity, reason, params_json
+    cursor: usize,
+}
+
+fn suggest_bind(bind: &BindInfo, table: &str) -> Result<SuggestState, ExtensionError> {
+    bind.add_result_column("rule", TypeId::Varchar)
+        .add_result_column("column_name", TypeId::Varchar)
+        .add_result_column("severity", TypeId::Varchar)
+        .add_result_column("reason", TypeId::Varchar)
+        .add_result_column("params", TypeId::Varchar);
+
+    let mut rows = Vec::new();
+
+    // Row count (table-level signals)
+    let total: i64 = match run_query_rows(&format!("SELECT COUNT(*) FROM {}", table)) {
+        Ok(r) if !r.is_empty() && !r[0].is_empty() => r[0][0].parse().unwrap_or(-1),
+        _ => -1,
+    };
+    if total == 0 {
+        rows.push((
+            "expect_table_row_count_between".into(),
+            String::new(),
+            "high".into(),
+            "table is empty".into(),
+            r#"{"min": 1}"#.into(),
+        ));
+    }
+
+    // Per-column signals from SUMMARIZE.
+    // Positional: [0] column_name [1] column_type [2] min [3] max [4] approx_unique
+    // [5] avg [6] std [7] q25 [8] q50 [9] q75 [10] count [11] null_percentage
+    if let Ok(out) = run_query_rows(&format!("SUMMARIZE SELECT * FROM {}", table)) {
+        for row in out {
+            let get = |i: usize| row.get(i).cloned().unwrap_or_default();
+            let col = get(0);
+            let count: f64 = get(10).parse().unwrap_or(0.0);
+            let null_pct: f64 = get(11).parse().unwrap_or(0.0);
+            let distinct: f64 = get(4).parse().unwrap_or(0.0);
+
+            if count == 0.0 {
+                continue; // column never populated; row-count rule already covers empty table
+            }
+
+            // High null ratio → not-null check
+            if null_pct > 10.0 {
+                rows.push((
+                    "expect_column_values_not_null".into(),
+                    col.clone(),
+                    if null_pct > 50.0 { "high" } else { "medium" }.into(),
+                    format!("{:.0}% of values are NULL", null_pct),
+                    format!(r#"{{"column": "{}"}}"#, col),
+                ));
+            }
+
+            // Near-constant column (distinct ≤ 2, non-key) → value-set check
+            if distinct > 0.0 && distinct <= 2.0 && count >= 5.0 {
+                rows.push((
+                    "expect_column_values_to_be_in_set".into(),
+                    col.clone(),
+                    "medium".into(),
+                    format!("column has only {:.0} distinct values (likely constant/flag)", distinct),
+                    format!(r#"{{"column": "{}", "value_set": []}}"#, col),
+                ));
+            }
+
+            // Massive duplication (distinct/count < 1%) → unique-check candidate
+            if count >= 100.0 && distinct > 0.0 && (distinct / count) < 0.01 {
+                rows.push((
+                    "expect_column_values_unique".into(),
+                    col.clone(),
+                    "low".into(),
+                    format!(
+                        "{:.0} rows but only {:.0} distinct values — check for accidental duplication",
+                        count, distinct
+                    ),
+                    format!(r#"{{"column": "{}"}}"#, col),
+                ));
+            }
+        }
+    }
+
+    Ok(SuggestState { rows, cursor: 0 })
+}
+
+fn suggest_scan(state: &mut SuggestState, chunk: &DataChunk) -> Result<(), ExtensionError> {
+    if state.cursor >= state.rows.len() {
+        unsafe { chunk.set_size(0) };
+        return Ok(());
+    }
+    let (rule, col, sev, reason, params) = &state.rows[state.cursor];
+    unsafe {
+        chunk.writer(0).write_str(0, rule);
+        chunk.writer(1).write_str(0, col);
+        chunk.writer(2).write_str(0, sev);
+        chunk.writer(3).write_str(0, reason);
+        chunk.writer(4).write_str(0, params);
+        chunk.set_size(1);
+    }
+    state.cursor += 1;
+    Ok(())
+}
+
 // ─── validate_expectations(table, json) ─────────────────────────────────
 
 fn validate_expectations_bind(
@@ -1620,6 +1730,16 @@ fn register(con: &Connection) -> Result<(), ExtensionError> {
             profile_table_bind(bind, &table)
         })
         .scan(profile_scan).build()?;
+    unsafe { let _ = con.register_table(tf); }
+
+    // dq_suggest(table) → candidate rules from profile signals
+    let tf = TableFunctionBuilder::new("dq_suggest")
+        .param(TypeId::Varchar)
+        .with_state::<SuggestState, _>(move |bind| {
+            let table = unsafe { bind.get_parameter_value(0) }.as_str().unwrap_or_default().to_string();
+            suggest_bind(bind, &table)
+        })
+        .scan(suggest_scan).build()?;
     unsafe { let _ = con.register_table(tf); }
 
     // validate_expectations(table, json)

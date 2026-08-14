@@ -224,3 +224,33 @@ FROM dq_dashboard('sales', '{
   "expect_column_values_in_range": {"column": "amount", "min": 0, "max": 100000}
 }');  -- 4 checks; unique FAILS (7/8) + in_range FAILS (-10 < 0) → failed=2, pass_rate=0.5
 
+-- 47. dq_suggest: profile-driven candidate rules with severity + reason
+SELECT '47. dq_suggest(sales) — null/duplication signals surfaced' AS test;
+CREATE OR REPLACE TABLE dirty AS
+SELECT * FROM (VALUES
+    (1, NULL, 'x'),
+    (2, NULL, 'x'),
+    (3, NULL, 'x'),
+    (4, 10.0, 'x'),
+    (5, 20.0, 'y'),
+    (5, 30.0, 'y'),
+    (5, 40.0, 'y'),
+    (5, 50.0, 'y')
+) t(id, val, flag);   -- val 37.5% null; flag constant-ish (2 distinct); id duplicated
+SELECT rule, column_name, severity, reason, json_valid(params) AS params_ok
+FROM dq_suggest('dirty')
+ORDER BY severity DESC, column_name;
+-- expect: not_null on val (medium, 37% null); in_set on flag (medium, 2 distinct)
+-- id has 5 distinct/8 rows = 62% — below the 1% duplication bar, no unique suggestion
+SELECT '47b. dq_suggest(empty) — empty-table row-count rule' AS test;
+CREATE OR REPLACE TABLE empty_tbl AS SELECT * FROM (VALUES (1)) t(x) WHERE 1=0;
+SELECT rule, column_name, severity, reason, json_valid(params) AS params_ok
+FROM dq_suggest('empty_tbl');
+-- expect: single high-severity expect_table_row_count_between, min=1
+
+-- 48. dq_suggest → validate_expectations round-trip: suggested rule runs
+SELECT '48. round-trip: run suggested not_null rule on dirty.val' AS test;
+SELECT rule, column_name, passed, failed_count, error
+FROM validate_expectations('dirty', '{"expect_column_values_not_null": {"column": "val"}}');
+-- expect FAIL: 3 of 8 rows NULL
+
