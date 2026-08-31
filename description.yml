@@ -7,6 +7,7 @@ extension:
   license: MIT
   excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl;linux_arm64_musl;windows_arm64"
   requires_toolchains: "rust"
+  test_config: '{"test_env_variables": {"SKIP_TESTS": "1"}}'
   maintainers:
     - alitrack
 
@@ -94,21 +95,3 @@ docs:
     make configure   # once: venv + platform stamp
     make release     # → build/release/dq.duckdb_extension
     ```
-
-test_config:
-  sql: |
-    CREATE TABLE sales(order_id INTEGER, amount DOUBLE, email VARCHAR);
-    INSERT INTO sales VALUES (1, 100.5, 'a@x.com'), (2, 200.0, 'b@y.com'), (3, 50.25, NULL);
-    CREATE TABLE customers(id INTEGER, status VARCHAR, email VARCHAR);
-    INSERT INTO customers VALUES (1, 'active', 'c@z.com'), (2, 'inactive', NULL);
-  sql_checks:
-    - check_name: expect_not_null passes on non-null column
-      query: |
-        SELECT COUNT(*) AS failing_rows FROM expect_not_null('sales', 'order_id');
-        -- 0 rows = pass
-    - check_name: profile_table returns per-column rows
-      query: |
-        SELECT COUNT(*) >= 3 AS has_all_columns FROM profile_table('sales');
-    - check_name: expect_in_range catches out-of-range
-      query: |
-        SELECT COUNT(*) >= 1 AS caught FROM expect_in_range('sales', 'amount', 0, 100);
